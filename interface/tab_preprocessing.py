@@ -16,6 +16,34 @@ from utils.plots import (
     figure_to_rgba_flat,
 )
 
+def _time_sorted(events):
+    """Drops non-finite events and returns the event arrays sorted by time.
+
+    Event streams from the camera are already sorted, in which case nothing is
+    copied. Sorted times let every time window be taken with np.searchsorted.
+    """
+    if events is None:
+        return None
+    xs, ys, ts, ps = events
+    n = min(len(xs), len(ys), len(ts))
+    if ps is not None:
+        n = min(n, len(ps))
+        ps = ps[:n]
+    xs, ys, ts = xs[:n], ys[:n], ts[:n]
+    finite = np.isfinite(ts)
+    for a in (xs, ys):
+        if a.dtype.kind == "f":
+            finite &= np.isfinite(a)
+    if not finite.all():
+        xs, ys, ts = xs[finite], ys[finite], ts[finite]
+        ps = ps[finite] if ps is not None else None
+    if ts.size > 1 and not bool(np.all(ts[1:] >= ts[:-1])):
+        order = np.argsort(ts, kind="stable")
+        xs, ys, ts = xs[order], ys[order], ts[order]
+        ps = ps[order] if ps is not None else None
+    return xs, ys, ts, ps
+
+
 class PreprocessingTab:
     label: str = "Preprocessing"
 
@@ -324,18 +352,19 @@ class PreprocessingTab:
 
             self.last_loaded_data = loaded.data
             self.last_loaded_file_ext = loaded.file_ext
-            self.load_data_preview()
+            self.load_data_preview(loaded)
             dpg.set_value("validation_status", loaded.status_message)
             self.log_status(f"File validated successfully: {self.data_file}")
         except Exception as exc:
             dpg.set_value("validation_status", f"Error: {exc}")
             self.log_status(f"File validation failed: {exc}")
 
-    def load_data_preview(self) -> None:
+    def load_data_preview(self, loaded=None) -> None:
         if not self.data_file:
             return
         try:
-            loaded = load_data_file(self.data_file)
+            if loaded is None:  # validate_file passes the data it just loaded (no second load)
+                loaded = load_data_file(self.data_file)
             data = loaded.data
             file_ext = loaded.file_ext
 
@@ -347,11 +376,11 @@ class PreprocessingTab:
             self.update_preprocessing_parameters_display()
 
             events = EventDataHelper.extract_event_points(file_ext, data, self.data_file)
-            self.raw_events = events
+            self.raw_events = _time_sorted(events)
             xs, ys, ts, ps = self.raw_events
 
-            tmin = float(np.min(ts))
-            tmax = float(np.max(ts))
+            tmin = float(ts[0])
+            tmax = float(ts[-1])
             
             self.params["tmin"] = tmin
             self.params["tmax"] = tmax
@@ -375,7 +404,7 @@ class PreprocessingTab:
             self.update_pseudoframe_from_data("Data loaded, ROI applied.")
             
             xs, ys, ts, ps = self.filtered_events if self.filtered_events else self.raw_events
-            self.display_t0 = float(np.min(ts))
+            self.display_t0 = float(ts[0]) if len(ts) else None
         except Exception as exc:
             dpg.set_value("data_preview_text", f"Error loading preview: {exc}")
             self.log_status(f"Error loading data preview: {exc}")
@@ -384,57 +413,66 @@ class PreprocessingTab:
         if not getattr(self, "raw_events", None):
             self.filtered_events = None
             return
-    
+
         xs, ys, ts, ps = self.raw_events
-    
+
         xmin = int(self.params.get("roi_xmin", 0))
         xmax = int(self.params.get("roi_xmax", 1279))
         ymin = int(self.params.get("roi_ymin", 0))
         ymax = int(self.params.get("roi_ymax", 719))
-    
+
         if xmax < xmin:
             xmin, xmax = xmax, xmin
         if ymax < ymin:
             ymin, ymax = ymax, ymin
-    
-        X = np.asarray(xs).astype(np.int64)
-        Y = np.asarray(ys).astype(np.int64)
-        T = np.asarray(ts).astype(np.float64)
-        P = np.asarray(ps) if ps is not None else None
-    
-        mask = (X >= xmin) & (X <= xmax) & (Y >= ymin) & (Y <= ymax)
-    
+
+        # raw events are time sorted (see _time_sorted): the time crop is a slice
+        lo, hi = 0, len(ts)
         if bool(self.params.get("time_crop_enabled", False)):
             tmin = self.params.get("tmin", None)
             tmax = self.params.get("tmax", None)
+            tmin_f = float(tmin) if tmin is not None and str(tmin) != "" else None
+            tmax_f = float(tmax) if tmax is not None and str(tmax) != "" else None
+            if tmin_f is not None and tmax_f is not None and tmax_f < tmin_f:
+                tmin_f, tmax_f = tmax_f, tmin_f
+            if tmin_f is not None:
+                lo = int(np.searchsorted(ts, tmin_f, side="left"))
+            if tmax_f is not None:
+                hi = int(np.searchsorted(ts, tmax_f, side="right"))
+            hi = max(hi, lo)
+        X = xs[lo:hi]
+        Y = ys[lo:hi]
+        T = ts[lo:hi]
+        P = ps[lo:hi] if ps is not None else None
 
-            if tmin is not None and str(tmin) != "":
-                tmin_f = float(tmin)
-                mask = mask & (T >= tmin_f)
-    
-            if tmax is not None and str(tmax) != "":
-                tmax_f = float(tmax)
-                mask = mask & (T <= tmax_f)
-    
-            if tmin is not None and tmax is not None and str(tmin) != "" and str(tmax) != "":
-                tmin_f = float(tmin)
-                tmax_f = float(tmax)
-                if tmax_f < tmin_f:
-                    tmin_f, tmax_f = tmax_f, tmin_f
-                    mask = (X >= xmin) & (X <= xmax) & (Y >= ymin) & (Y <= ymax)
-                    mask = mask & (T >= tmin_f) & (T <= tmax_f)
-                    
+        # only build the masks that can remove events
+        mask = None
+        def _and(m):
+            nonlocal mask
+            mask = m if mask is None else (mask & m)
+        if X.size:
+            if X.min() < xmin:
+                _and(X >= xmin)
+            if X.max() > xmax:
+                _and(X <= xmax)
+            if Y.min() < ymin:
+                _and(Y >= ymin)
+            if Y.max() > ymax:
+                _and(Y <= ymax)
         if self.params.get("use_only_pos", True) and P is not None:
-            mask = mask & (P > 0)
-    
-        Xf = X[mask]
-        Yf = Y[mask]
-        Tf = T[mask]
-        Pf = P[mask] if P is not None else None
-    
+            _and(P > 0)
+
+        if mask is not None:
+            X, Y, T = X[mask], Y[mask], T[mask]
+            P = P[mask] if P is not None else None
+        # integer pixel coordinates; int32 halves the memory of int64 (values < 2^31)
+        Xf = X.astype(np.int32)
+        Yf = Y.astype(np.int32)
+        Tf = np.asarray(T, dtype=np.float64)
+        Pf = P
         self.filtered_events = (Xf, Yf, Tf, Pf)
-        self.log_status(f"Filters applied: kept {Xf.size} / {X.size} events")
-        
+        self.log_status(f"Filters applied: kept {Xf.size} / {len(xs)} events")
+
     def update_roi_param(self, sender, app_data, user_data):
         self.params[user_data] = int(app_data)
 
@@ -584,16 +622,8 @@ class PreprocessingTab:
             width = 1280
             height = 720
             
-            ts_arr = np.asarray(ts).flatten()
-            xs_arr = np.asarray(xs).flatten()
-            ys_arr = np.asarray(ys).flatten()
-            
-            n = min(xs_arr.size, ys_arr.size, ts_arr.size)
-            xs_arr, ys_arr, ts_arr = xs_arr[:n], ys_arr[:n], ts_arr[:n]
-            
-            m = np.isfinite(xs_arr) & np.isfinite(ys_arr) & np.isfinite(ts_arr)
-            xs_arr, ys_arr, ts_arr = xs_arr[m], ys_arr[m], ts_arr[m]
-            
+            ts_arr, xs_arr, ys_arr = ts, xs, ys  # time sorted and finite (see _time_sorted)
+
             if xs_arr.size == 0:
                 self.update_pseudoframe_visualization(None, "No valid events for accumulation.")
                 return
@@ -602,14 +632,16 @@ class PreprocessingTab:
             step = acc_ms * 1000.0  
             
             if self.display_t0 is None:
-                self.display_t0 = float(np.min(ts_arr))
-            
+                self.display_t0 = float(ts_arr[0])
+
             T_min = float(self.display_t0)
             T_max = T_min + step
-            
-            mask = (ts_arr > T_min) & (ts_arr <= T_max)
-            X = xs_arr[mask].astype(np.int64)
-            Y = ys_arr[mask].astype(np.int64)
+
+            # window (T_min, T_max] by binary search instead of scanning all events
+            lo, hi = np.searchsorted(ts_arr, [T_min, T_max], side="right")
+            n_window = int(hi - lo)
+            X = xs_arr[lo:hi].astype(np.int64)
+            Y = ys_arr[lo:hi].astype(np.int64)
 
             valid = (X >= 0) & (X < width) & (Y >= 0) & (Y < height)
             X, Y = X[valid], Y[valid]
@@ -617,7 +649,7 @@ class PreprocessingTab:
             I = np.zeros((height, width), dtype=np.float32)
             I[Y.astype(np.intp), X.astype(np.intp)] = 1.0
 
-            self.update_pseudoframe_visualization(I, f"Accumulation preview ({int(mask.sum())} events).")
+            self.update_pseudoframe_visualization(I, f"Accumulation preview ({n_window} events).")
             for tag in list(self._pseudoframe_time_info_tags):
                 if dpg.does_item_exist(tag):
                     dpg.set_value(tag, f"t: [{T_min:.0f} .. {T_max:.0f}] (display window)")
@@ -645,13 +677,15 @@ class PreprocessingTab:
         acc_ms = float(self.params.get("accumulation_time_ms", 2.0))
         step = acc_ms * 1000.0
     
+        if len(ts) == 0:
+            return
         if self.display_t0 is None:
-            self.display_t0 = float(np.min(ts))
-    
+            self.display_t0 = float(ts[0])
+
         new_t0 = float(self.display_t0) + direction * step
 
-        data_min = float(np.min(ts))
-        data_max = float(np.max(ts))
+        data_min = float(ts[0])   # events are time sorted
+        data_max = float(ts[-1])
         if new_t0 < data_min:
             new_t0 = data_min
         if new_t0 + step > data_max:

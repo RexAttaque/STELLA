@@ -51,23 +51,72 @@ else:
  
 T_min = np.min(T_global)
 T_max = np.max(T_global)
+# optional start time (the test run detects in the frame shown in the GUI)
+if globals().get("t_start", None) is not None:
+    T_min = max(T_min, float(t_start))
+
+
+def _is_time_sorted(T):
+    return T.size < 2 or bool(np.all(T[1:] >= T[:-1]))
+
+
+def _time_window(t_lo, t_hi):
+    """Events with t_lo <= T_global <= t_hi as (X + 1, Y + 1, T copy, global indices).
+
+    The event stream is time sorted, so the window is found by binary search
+    (O(log n)) instead of comparing every event of the recording at every step.
+    """
+    if _T_sorted:
+        lo = int(np.searchsorted(T_global, t_lo, side="left"))
+        hi = max(int(np.searchsorted(T_global, t_hi, side="right")), lo)
+        return X_global[lo:hi] + 1, Y_global[lo:hi] + 1, T_global[lo:hi].copy(), np.arange(lo, hi)
+    mask = np.logical_and(T_global >= t_lo, T_global <= t_hi)
+    return X_global[mask] + 1, Y_global[mask] + 1, T_global[mask], np.where(mask)[0]
+
+
+def _group_by_label(labels):
+    """(label, ascending positions) for every non-zero label, labels in ascending order."""
+    sel = np.flatnonzero(labels)
+    if sel.size == 0:
+        return []
+    order = sel[np.argsort(labels[sel], kind="stable")]
+    labs = labels[order]
+    cuts = np.flatnonzero(labs[1:] != labs[:-1]) + 1
+    starts = np.concatenate(([0], cuts))
+    ends = np.concatenate((cuts, [order.size]))
+    return [(labs[a], order[a:b]) for a, b in zip(starts, ends)]
+
+
+def _dilate(mask):
+    # a 1x1 structuring element (the default mask size) leaves the mask unchanged
+    if structure.size == 1:
+        return mask.copy()
+    return binary_dilation(mask, structure=structure, iterations=1)
+
+
+def _clear_label(labelmap, i_best):
+    # same as labelmap[labelmap == i_best] = -1: the label was only written on active_pixels[i_best]
+    reg = active_pixels[i_best]
+    if len(reg) == 0:
+        return
+    rx = reg[:, 0]
+    ry = reg[:, 1]
+    hit = labelmap[rx, ry] == i_best
+    labelmap[rx[hit], ry[hit]] = -1
 
 tic_start_ges = time.time()
 #%% main loop
 for multi in range(multiN):
+    _T_sorted = _is_time_sorted(T_global)
     for k in range(N):
         tic_start = time.time()     
         if pixelwise_extension:
             if k>0:
-                mask = np.logical_and(T_global >= T_min + (k-overlap) * dt, T_global <= T_min + (k+1) * dt)
+                X, Y, T, ind_global = _time_window(T_min + (k-overlap) * dt, T_min + (k+1) * dt)
             else:
-                mask = np.logical_and(T_global >= T_min + k * dt, T_global <= T_min + (k+1) * dt)
+                X, Y, T, ind_global = _time_window(T_min + k * dt, T_min + (k+1) * dt)
         else:
-            mask = np.logical_and(T_global >= T_min + k * dt, T_global <= T_min + (k+1) * dt)
-        X = X_global[mask] + 1
-        Y = Y_global[mask] + 1
-        T = T_global[mask]
-        ind_global = np.where(mask)[0]
+            X, Y, T, ind_global = _time_window(T_min + k * dt, T_min + (k+1) * dt)
         if pixelwise_extension:
             T[T<T_min+k*dt] = -1
         if pseudo_images:
@@ -80,15 +129,17 @@ for multi in range(multiN):
                 centroids, coords = analyze_pseudo_image(X,Y,height,width,area,filtersize)            
                 lookup = defaultdict(list)
                 for i, (x, y) in enumerate(zip(X.ravel(), Y.ravel())):
-                    lookup[(x, y)].append(ind_global[i])
+                    lookup[(x, y)].append(i)
+                X_r, Y_r, T_r = X.ravel(), Y.ravel(), T.ravel()
                 for i, arr in enumerate(coords):
                     for x, y in arr:
                         if (x, y) in lookup:
-                            for idx in lookup[(x+1, y+1)]:
-                                ind_clust[i].append(idx)
-                                x_clust[i].append(X.ravel()[ind_global==idx])
-                                y_clust[i].append(Y.ravel()[ind_global==idx])
-                                t_clust[i].append(T.ravel()[ind_global==idx])
+                            # ind_global is unique: X[ind_global == idx] is the single element j
+                            for j in lookup[(x+1, y+1)]:
+                                ind_clust[i].append(ind_global[j])
+                                x_clust[i].append(X_r[j:j+1])
+                                y_clust[i].append(Y_r[j:j+1])
+                                t_clust[i].append(T_r[j:j+1])
                 ind_clust = [np.array(a, dtype=int) if len(a) > 0 else np.array([]) for a in ind_clust]
                 x_clust   = [np.array(a) if len(a) > 0 else np.array([]) for a in x_clust]
                 y_clust   = [np.array(a) if len(a) > 0 else np.array([]) for a in y_clust]
@@ -110,40 +161,16 @@ for multi in range(multiN):
                 XY = np.column_stack((X-1,Y-1))
                 new_mask = np.zeros((height, width), dtype=bool)
                 new_mask[X-1,Y-1] = True
-                new_mask = binary_dilation(new_mask, structure=structure, iterations=1)
+                new_mask = _dilate(new_mask)
                 labeled, num_regions = label(new_mask)
                 
                 region_sizes = np.bincount(labeled.ravel())
                 keep = region_sizes >= N_pixelwise
                 labeled[~keep[labeled]] = 0
-                new_labels = np.unique(labeled)
-                new_labels = new_labels[new_labels != 0]
-                
-                region_coords = defaultdict(list)
-                region_indices = defaultdict(list) 
-                
-                xs, ys = np.nonzero(labeled > 0)
-                for i, (x, y) in enumerate(zip(xs, ys)):
-                    label_0 = labeled[x, y]
-                    if label_0 in new_labels:
-                        region_coords[label_0].append((x, y))
-                pixel_to_indices = defaultdict(list)
-                for i, (x_, y_) in enumerate(XY):
-                    pixel_to_indices[(x_, y_)].append(i)
-                for label_0 in region_coords:
-                    coords = region_coords[label_0]
-                    indices = []
-                    for x, y in coords:
-                        indices.extend(pixel_to_indices[(x, y)])  
-                    region_coords[label_0] = np.array(coords, dtype=np.uint16)
-                    region_indices[label_0] = np.array(indices, dtype=np.uint32)
-                    
-                idx = np.zeros(len(X), dtype=np.int16)  
-    
-                for label_0, indices in region_indices.items():
-                    idx[indices] = label_0
-                      
-                idx[idx==0]=-1    
+                # every event gets the label of its (kept) region; same int16 storage as before
+                idx = labeled[XY[:, 0], XY[:, 1]].astype(np.int16)
+
+                idx[idx==0]=-1        
                     
                 if max_tracks > 0 and save_mode==False:
                     idx[idx > max_tracks] = -1   
@@ -156,11 +183,9 @@ for multi in range(multiN):
                 idx = idx[valid_clusters]
         
                 max_cluster = idx.max() if len(idx) > 0 else -1
-                
-                for i in range(max_cluster+1):
-                    mask = idx == i
-                    if not mask.any():
-                        continue
+
+                # events of each cluster in their original order (stable sort), clusters ascending
+                for i, mask in _group_by_label(np.where(idx > 0, idx, 0)):
                     x_clust[i] = X[mask]
                     y_clust[i] = Y[mask]
                     t_clust[i] = T[mask] 
@@ -172,14 +197,14 @@ for multi in range(multiN):
                         for j in range(num_points):
                             mask = np.where((t_clust[i]>=bins[j]) & (t_clust[i]<=bins[j+1]))
                             if mask[0].size > 0:
-                                x_m[i] = np.append(x_m[i], np.median(x_clust[i][mask]))
-                                y_m[i] = np.append(y_m[i], np.median(y_clust[i][mask]))
-                                t_m[i] = np.append(t_m[i], np.median(t_clust[i][mask])* 1e-6)
+                                x_m[i] = np.append(x_m[i], fast_median(x_clust[i][mask]))
+                                y_m[i] = np.append(y_m[i], fast_median(y_clust[i][mask]))
+                                t_m[i] = np.append(t_m[i], fast_median(t_clust[i][mask])* 1e-6)
                                 num_involved[i] +=1
                     else:
-                        x_m[i] = np.median(x_clust[i])
-                        y_m[i] = np.median(y_clust[i])
-                        t_m[i] = np.median(t_clust[i])* 1e-6
+                        x_m[i] = fast_median(x_clust[i])
+                        y_m[i] = fast_median(y_clust[i])
+                        t_m[i] = fast_median(t_clust[i])* 1e-6
         
                     del_[i] = 0
                     inactive[i] = 0
@@ -212,14 +237,14 @@ for multi in range(multiN):
                         for j in range(num_points):
                             mask = np.where((t_clust[i]>=bins[j]) & (t_clust[i]<=bins[j+1]))
                             if mask[0].size > 0:
-                                x_m[i] = np.append(x_m[i], np.median(x_clust[i][mask]))
-                                y_m[i] = np.append(y_m[i], np.median(y_clust[i][mask]))
-                                t_m[i] = np.append(t_m[i], np.median(t_clust[i][mask])* 1e-6)
+                                x_m[i] = np.append(x_m[i], fast_median(x_clust[i][mask]))
+                                y_m[i] = np.append(y_m[i], fast_median(y_clust[i][mask]))
+                                t_m[i] = np.append(t_m[i], fast_median(t_clust[i][mask])* 1e-6)
                                 num_involved[i] +=1
                     else:
-                        x_m[i] = np.median(x_clust[i])
-                        y_m[i] = np.median(y_clust[i])
-                        t_m[i] = np.median(t_clust[i])* 1e-6
+                        x_m[i] = fast_median(x_clust[i])
+                        y_m[i] = fast_median(y_clust[i])
+                        t_m[i] = fast_median(t_clust[i])* 1e-6
         
                     del_[i] = 0
                     inactive[i] = 0
@@ -279,7 +304,7 @@ for multi in range(multiN):
                 orig_mask = np.zeros((height, width), dtype=bool)
                 orig_mask[XY[:, 0], XY[:, 1]] = True
                 
-                dilated_mask = binary_dilation(orig_mask, structure=structure, iterations=1)
+                dilated_mask = _dilate(orig_mask)
                 labeled, num_regions = label(dilated_mask)
                 labels_xy = labeled[XY[:, 0], XY[:, 1]]
                 region_sizes = np.bincount(labels_xy, minlength=labeled.max() + 1)
@@ -290,30 +315,24 @@ for multi in range(multiN):
                 new_labels = np.unique(labels_xy)
                 new_labels = new_labels[new_labels != 0]
                 
+                # event coordinates / indices of every region, in event order
                 region_coords = defaultdict(list)
                 region_indices = defaultdict(list)
-                for i, (x, y) in enumerate(XY):
-                    label_0 = labels_xy[i]
-                
-                    if label_0 == 0:
-                        continue
-                
-                    region_coords[label_0].append((x, y))
-                    region_indices[label_0].append(i)
-                
-                for label_0 in new_labels:
-                    region_coords[label_0] = np.array(region_coords[label_0], dtype=np.uint16)
-                    region_indices[label_0] = np.array(region_indices[label_0], dtype=np.uint32)
-                
-                active_labelmap = np.zeros_like(orig_mask, dtype=np.int32)  
-                active_labelmap[:, :] = -1  
-                
-                for i, region in enumerate(active_pixels):
-                    if len(region) == 0 or valid[i] == 0:
+                for label_0, members in _group_by_label(labels_xy):
+                    region_coords[label_0] = XY[members].astype(np.uint16)
+                    region_indices[label_0] = members.astype(np.uint32)
+
+                active_labelmap = np.zeros_like(orig_mask, dtype=np.int32)
+                active_labelmap[:, :] = -1
+
+                # only the valid clusters (the others are skipped anyway)
+                for i in np.flatnonzero(np.asarray(valid[:len(active_pixels)]) != 0):
+                    region = active_pixels[i]
+                    if len(region) == 0:
                         continue
                     active_labelmap[region[:, 0], region[:, 1]] = i
                     
-                active_temp =  [[] for _ in range(len(active_pixels))]
+                active_temp = defaultdict(list)  # only matched clusters get entries
                 ind_temp = []
                 
                 assigned_region_labels = set()
@@ -322,8 +341,6 @@ for multi in range(multiN):
                     coords = region_coords[label_0]
                     if coords.shape[0] == 0:
                         continue    
-                    mean_coords = np.mean(coords, axis=0)
-                    mean_x, mean_y = mean_coords[0], mean_coords[1]
 
                     if multi==1:
                         max_x, max_y = active_labelmap.shape
@@ -380,8 +397,8 @@ for multi in range(multiN):
                         t_clust[i_best] = t_clust[i_best][mask]
                         ind_clust[i_best] = ind_clust[i_best][mask]
                         
-                        active_labelmap[active_labelmap==i_best]=-1
-                    
+                        _clear_label(active_labelmap, i_best)
+
                         active_temp[i_best].append(xx)
                         ind_temp.append(i_best)
                         labeled[xx[:, 0], xx[:, 1]] = 0
@@ -441,24 +458,22 @@ for multi in range(multiN):
                             t_clust[i_best] = t_clust[i_best][mask]
                             ind_clust[i_best] = ind_clust[i_best][mask]
                             
-                            active_labelmap[active_labelmap==i_best]=-1
+                            _clear_label(active_labelmap, i_best)
                             active_temp[i_best].append(xx)
                             ind_temp.append(i_best)
                             labeled[xx[:, 0], xx[:, 1]] = 0
                         assigned_region_labels.add(label_0)
                         
                 ind_temp = np.unique(ind_temp)
-                for ii in range(len(active_pixels)):
-                    if valid[ii]==0:
-                        continue
-                    if ii in ind_temp:
-                        if len(active_temp[ii])>1:
-                            active_pixels[ii] = np.concatenate(active_temp[ii], axis=0)
-                        else:
-                            active_pixels[ii] = active_temp[ii][0]
+                cand = np.flatnonzero(np.asarray(valid[:len(active_pixels)]) != 0)
+                matched = np.isin(cand, ind_temp)
+                for ii in cand[matched]:
+                    if len(active_temp[ii])>1:
+                        active_pixels[ii] = np.concatenate(active_temp[ii], axis=0)
                     else:
-                        valid[ii] = 0
-                        inactive_k[ii] = k
+                        active_pixels[ii] = active_temp[ii][0]
+                valid[cand[~matched]] = 0
+                inactive_k[cand[~matched]] = k
                     
             elif db_clustering:
                 if len(X)<1:
@@ -476,8 +491,8 @@ for multi in range(multiN):
                 max_cluster = idx.max() if len(idx) > 0 else -1
                 for i in range(max_cluster):
                     mask = idx == i
-                    x_temp[i] = np.median(X[mask])
-                    y_temp[i] = np.median(Y[mask])
+                    x_temp[i] = fast_median(X[mask])
+                    y_temp[i] = fast_median(Y[mask])
                     
                 nearest_indices, x_clust, y_clust, x_m, y_m, t_m, steps, inactive_k, valid, t_clust, num_involved, ind_clust = db_matching(
                     valid,x_m,y_m,t_m,x_temp,y_temp,max_tracks,threshold,idx,del_,steps,buffer,steps_rev,X,Y,T,x_clust,y_clust,t_clust,k,inactive_k,lightweight_mode,num_points,num_involved,ind_clust, ind_global)
@@ -580,20 +595,21 @@ for multi in range(multiN):
                 
                 if missing > 0:
                     extend_size = missing
-                    x_clust = extend_list_of_arrays(x_clust, extend_size, (max_length,))
-                    y_clust = extend_list_of_arrays(y_clust, extend_size, (max_length,))
-                    t_clust = extend_list_of_arrays(t_clust, extend_size, (max_length,))
-                    ind_clust = extend_list_of_arrays(ind_clust, extend_size, (max_length,))
-                    active_pixels = extend_list_of_arrays(active_pixels, extend_size, (max_length,))
-                    P_new = extend_list_of_arrays(P_new, extend_size, (3,3))
-                    P_newz = extend_list_of_arrays(P_newz, extend_size, (3,3))
+                    # new slots start empty (they are filled below); np.full((max_length,), nan)
+                    # placeholders cost 4 MB per slot and stayed in the output as all-NaN clusters
+                    x_clust = extend_list_of_arrays(x_clust, extend_size, (0,))
+                    y_clust = extend_list_of_arrays(y_clust, extend_size, (0,))
+                    t_clust = extend_list_of_arrays(t_clust, extend_size, (0,))
+                    ind_clust = extend_list_of_arrays(ind_clust, extend_size, (0,))
+                    active_pixels = extend_list_of_arrays(active_pixels, extend_size, (0,))
+                    # (P_new / P_newz only exist in the tracking script: extending them raised NameError)
                     x_est = extend_list_of_arrays(x_est, extend_size, (3,))
                     y_est = extend_list_of_arrays(y_est, extend_size, (3,))
                 
                     if lightweight_mode or pseudo_images:
-                        x_m = extend_list_of_arrays(x_m, extend_size, (max_length,))
-                        y_m = extend_list_of_arrays(y_m, extend_size, (max_length,))
-                        t_m = extend_list_of_arrays(t_m, extend_size, (max_length,))
+                        x_m = extend_list_of_arrays(x_m, extend_size, (0,))
+                        y_m = extend_list_of_arrays(y_m, extend_size, (0,))
+                        t_m = extend_list_of_arrays(t_m, extend_size, (0,))
                     else:
                         x_m = extend_1d(x_m, extend_size)
                         y_m = extend_1d(y_m, extend_size)
@@ -614,13 +630,16 @@ for multi in range(multiN):
                     lookup = defaultdict(list)
                     for j, (x, y) in enumerate(zip(X.ravel(), Y.ravel())):
                         lookup[(x, y)].append(j)
-                for i in range(1, max(idx) + 1):
-                    if i not in idx:
+                if not pseudo_images:
+                    # event positions of every cluster label (ascending, like idx == i)
+                    label_groups = dict(_group_by_label(np.where(idx > 0, idx, 0)))
+                for i in np.unique(idx):
+                    if i < 1:   # labels start at 1 here, as before
                         continue
                     if pseudo_images:
                         clust_idx = i
                     else:
-                        clust_idx = idx == i
+                        clust_idx = label_groups[i]
                     r = refil[m]
                     if pseudo_images:
                         tmp_ind = []
@@ -656,9 +675,9 @@ for multi in range(multiN):
                         for j in range(num_points):
                             mask = np.where((t_clust[r]>=bins[j]) & (t_clust[r]<=bins[j+1]))
                             if mask[0].size > 0:
-                                x_m[r] = np.append(x_m[r], np.median(x_clust[r][mask]))
-                                y_m[r] = np.append(y_m[r], np.median(y_clust[r][mask]))
-                                t_m[r] = np.append(t_m[r], np.median(t_clust[r][mask])* 1e-6)
+                                x_m[r] = np.append(x_m[r], fast_median(x_clust[r][mask]))
+                                y_m[r] = np.append(y_m[r], fast_median(y_clust[r][mask]))
+                                t_m[r] = np.append(t_m[r], fast_median(t_clust[r][mask])* 1e-6)
                         num_involved[r] = len(x_m[r])
                     elif pixelwise_extension:
                         mask = t_clust[r] >= 0
@@ -667,13 +686,13 @@ for multi in range(multiN):
                         t_clust[r] = t_clust[r][mask]
                         ind_clust[r] = ind_clust[r][mask]
                         active_pixels[r] = region_coords[np.int32(i)]
-                        x_m[r] = np.median(x_clust[r])
-                        y_m[r] = np.median(y_clust[r])
-                        t_m[r] = np.median(t_clust[r])* 1e-6
+                        x_m[r] = fast_median(x_clust[r])
+                        y_m[r] = fast_median(y_clust[r])
+                        t_m[r] = fast_median(t_clust[r])* 1e-6
                     else:
-                        x_m[r] = np.median(x_clust[r])
-                        y_m[r] = np.median(y_clust[r])
-                        t_m[r] = np.median(t_clust[r])* 1e-6
+                        x_m[r] = fast_median(x_clust[r])
+                        y_m[r] = fast_median(y_clust[r])
+                        t_m[r] = fast_median(t_clust[r])* 1e-6
                     valid[r] = 1
                     steps[r] = 1
                     del_[r] = 0
@@ -681,13 +700,9 @@ for multi in range(multiN):
                     inactive_k[r] = k
                     m+=1        
     
-            for i in range(max_tracks):
-                if pseudo_images == False:
-                    if len(t_clust[i][L_before[i]:])>1:
-                        L_before[i] = len(x_clust[i])
-
-                if steps[i]<buffer and steps[i] < 3 and (inactive_k[i] + 2) < k:
-                    inactive[i] = 1
+            # (the former L_before bookkeeping here was never read)
+            _n = int(max_tracks)
+            inactive[:_n][(steps[:_n] < buffer) & (steps[:_n] < 3) & ((inactive_k[:_n] + 2) < k)] = 1
 
         del_[:] = 1
         

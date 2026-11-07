@@ -1,4 +1,9 @@
 # STELLA - a modular framework for SpatioTemporal Event-based Lagrangian particLe trAcking
+
+> **About this fork** (branch `performance`): same features and results as the original STELLA, but much faster
+> on real recordings (`.raw` loading ~15x, pseudo-frame navigation ~80x, detection ~9x) with crash and memory
+> fixes, and no pyEBIV needed for `.raw` files. See [PERFORMANCE.md](PERFORMANCE.md) for what changed, the
+> measurements and how it was verified.
 We introduce STELLA (v1.0.2), a modular framework for **s**tatio**t**emporal **e**vent-based **L**agrangian partic**l**e tr**a**cking in fluid flows. The framework is implemented as a GUI in python and takes the raw event stream obtained from an event-based camera as input. Once the data is loaded, the processing is done in four steps: Preprocessing, Detection, Tracking, Validation. In preprocessing, a ROI can be set in time and space and the filtered events can be saved. Subsequently, different algorithms for direct processing and image-based detection can be used to identify clustered events associated to individual particles. Based on the clustered events, particle tracks (position, velocity) can be derived by using a Kalman filter, spline fitting or hybrid approaches. Finally, a track quality filter and a neighborhood filter can be applied to reject spurious tracks during validation. In every step, the evaluation results can be saved and loaded in a way that also just single modules of STELLA can be used. For further information, please find our paper here: [STELLA](https://link.springer.com/article/10.1007/s00348-026-04253-8).
 
 ![Pipeline Overview](images/workflow.png)
@@ -37,7 +42,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Hint: STELLA is able to read .raw files. However, to reduce loading time, you can use the standalone code `utils/convert_to_npz.py` or `utils/convert_to_npz_pyebiv.py` to convert from .raw or .dat to .npz or .mat.
+Hint: STELLA is able to read .raw files (EVT 3.0, with its own decoder; pyEBIV is not needed). However, to reduce loading time, you can use the standalone code `utils/convert_to_npz.py` or `utils/convert_to_npz_pyebiv.py` to convert from .raw or .dat to .npz or .mat.
     
 # Datasets
 Under `datasets/` you will find synthetic and experimental data as test cases. These datasets are rather small and can be used to try out different functionalities of STELLA.
@@ -55,7 +60,7 @@ To start the GUI, run `python main.py`. Changes in the set parameters are confir
 
 2) **Detection**
 - in the detection tab, select `pixelwise extension` as detection method
-- using default settings, click on `Test run` to perform the detection on the first frame
+- using default settings, click on `Test run` to perform the detection on the displayed frame
 - by activating `show found cluster centers`, the middle points of found clusters are marked in the pseudo-frame
       
 ![detection1](images/detection1.png)

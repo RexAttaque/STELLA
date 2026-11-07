@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-from utils.pyebiv import pyEBIV as EBIV
+from utils.raw_loader import load_raw
 
 @dataclass
 class LoadedData:
@@ -20,24 +20,10 @@ class LoadedData:
 def _load_events_with_metavision(
     file_path: str, delta_t: int = 1000
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[int], Optional[int]]:
-    
-    evData = EBIV()
-    evData.setDebugLevel(0) 
-    evData.loadRaw(file_path)
-
-    width: Optional[int] = None
-    height: Optional[int] = None
-    try:
-        h, w = evData.sensorSize()
-        height, width = int(h), int(w)
-    except Exception:
-        pass
-    
-    t = np.array(evData.time())
-    x = np.array(evData.x())
-    y = np.array(evData.y())
-    p = np.array(evData.p())
-    return x, y, t, p, width, height
+    # Numba EVT 3.0 decoder, identical events to pyEBIV.loadRaw() + time()/x()/y()/p()
+    # but ~10x faster and without converting 100 M events through Python lists.
+    raw = load_raw(file_path)
+    return raw.x, raw.y, raw.t.astype(np.float64), raw.p, raw.width, raw.height
 
 
 def load_data_file(file_path: str) -> LoadedData:
@@ -66,7 +52,7 @@ def load_data_file(file_path: str) -> LoadedData:
             data = {k: npz[k] for k in npz.files}
         status = f"Valid .npz file. Keys: {list(data.keys())[:8]}"
 
-    elif file_ext in (".raw"):
+    elif file_ext == ".raw":
         size_mb = os.path.getsize(file_path) / 1024 / 1024
         try:
             x, y, t, p, w, h = _load_events_with_metavision(file_path, delta_t=1000)

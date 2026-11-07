@@ -1,9 +1,10 @@
 from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Optional, TYPE_CHECKING
-import matplotlib.cm as cm
+from matplotlib import colormaps
 import matplotlib.pyplot as plt
 from utils.plots import figure_to_rgba_flat
+from utils.track_index import tracks_in_window
 import dearpygui.dearpygui as dpg
 import numpy as np
 import pickle
@@ -1232,12 +1233,12 @@ class TrackingTab:
             return v
     
     
-        x_plot = [np.asarray(x, dtype=float) - 1 for x in _get("x_plot")]
-        y_plot = [np.asarray(y, dtype=float) - 1 for y in _get("y_plot")]
-        t_plot = [np.asarray(t, dtype=float)       for t in _get("t_plot")]
-        x_plotv = [np.asarray(t, dtype=float)       for t in _get("x_plotv")]
-        y_plotv = [np.asarray(t, dtype=float)       for t in _get("y_plotv")]
-    
+        x_plot = _get("x_plot")
+        y_plot = _get("y_plot")
+        t_plot = _get("t_plot")
+        x_plotv = _get("x_plotv")
+        y_plotv = _get("y_plotv")
+
         if x_plot is None or y_plot is None or t_plot is None or x_plotv is None or y_plotv is None:
             return
 
@@ -1246,7 +1247,7 @@ class TrackingTab:
         if not isinstance(t_plot, (list, tuple)): t_plot = [t_plot]
         if not isinstance(x_plotv, (list, tuple)): x_plotv = [x_plotv]
         if not isinstance(y_plotv, (list, tuple)): y_plotv = [y_plotv]
-    
+
         n_tracks = min(len(x_plot), len(y_plot), len(t_plot), len(x_plotv), len(y_plotv))
         if n_tracks == 0:
             return
@@ -1271,12 +1272,14 @@ class TrackingTab:
     
         T_min = float(t0) - (factor-1.0) * acc_us
         T_max = float(t0) + acc_us
+        # only the tracks overlapping the window (time ranges cached per result)
+        shown = tracks_in_window(t_plot, T_min, T_max, n_tracks)
         vmins = []
         vmaxs = []
-        for i in range(n_tracks):
+        for i in shown:
             t = np.asarray(t_plot[i], dtype=float).ravel()
-            x = np.asarray(x_plot[i], dtype=float).ravel()
-            y = np.asarray(y_plot[i], dtype=float).ravel()
+            x = np.asarray(x_plot[i], dtype=float).ravel() - 1
+            y = np.asarray(y_plot[i], dtype=float).ravel() - 1
             xv = np.asarray(x_plotv[i], dtype=float).ravel()
             yv = np.asarray(y_plotv[i], dtype=float).ravel()
     
@@ -1307,7 +1310,7 @@ class TrackingTab:
         if vmax <= vmin:
             vmax = vmin + 1e-12
     
-        cmap = cm.get_cmap("viridis")
+        cmap = colormaps["viridis"]  # cm.get_cmap was removed in matplotlib 3.9
     
         def _speed_to_color(s: float):
             a = (s - vmin) / (vmax - vmin)
@@ -1315,23 +1318,23 @@ class TrackingTab:
             r, g, b, _ = cmap(a)
             return (int(r * 255), int(g * 255), int(b * 255), 255)
 
-        for i in range(n_tracks):
+        for i in shown:
             t = np.asarray(t_plot[i], dtype=float).ravel()
-            x = np.asarray(x_plot[i], dtype=float).ravel()
-            y = np.asarray(y_plot[i], dtype=float).ravel()
+            x = np.asarray(x_plot[i], dtype=float).ravel() - 1
+            y = np.asarray(y_plot[i], dtype=float).ravel() - 1
             xv = np.asarray(x_plotv[i], dtype=float).ravel()
             yv = np.asarray(y_plotv[i], dtype=float).ravel()
-    
+
             n = min(len(t), len(x), len(y), len(xv), len(yv))
             if n < 2:
                 continue
             t, x, y, xv, yv = t[:n], x[:n], y[:n], xv[:n], yv[:n]
-    
+
             m = np.isfinite(t) & np.isfinite(x) & np.isfinite(y) & np.isfinite(xv) & np.isfinite(yv)
             m &= (t >= T_min) & (t <= T_max)
             if np.count_nonzero(m) < 2:
                 continue
-    
+
             t = t[m]; x = x[m]; y = y[m]; xv = xv[m]; yv = yv[m]
             spd = np.sqrt(xv ** 2 + yv ** 2)
 

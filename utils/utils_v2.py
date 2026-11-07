@@ -1,5 +1,4 @@
 import numpy as np
-import hdbscan
 from sklearn.cluster import DBSCAN
 from scipy.spatial.distance import cdist
 from scipy.spatial import KDTree, cKDTree
@@ -10,7 +9,32 @@ from skimage.filters import threshold_otsu
 from contextlib import contextmanager
 from joblib.parallel import BatchCompletionCallBack
 from joblib import Parallel
-    
+from numba import njit
+
+
+@njit(cache=True, nogil=True)
+def _median_sorted(a):
+    n = a.size
+    if n == 0:
+        return np.nan
+    for v in a:
+        if np.isnan(v):
+            return np.nan
+    b = np.sort(a)
+    h = n // 2
+    if n % 2:
+        return b[h]
+    return (b[h - 1] + b[h]) / 2.0
+
+
+def fast_median(a):
+    """np.median of a 1-D array, same value (incl. NaN propagation), without numpy's
+    ~15 us per-call overhead (detection takes hundreds of thousands of small medians)."""
+    a = np.asarray(a)
+    if a.ndim != 1 or a.size == 0 or a.dtype.kind not in "iuf":
+        return np.median(a)
+    return float(_median_sorted(a.astype(np.float64)))
+        
 def compute_perpendicular_spread(events, velocity):
     if np.linalg.norm(velocity) == 0 or len(events) == 0:
         return 0.0
@@ -100,6 +124,7 @@ def process_index_lightweight_afterwards(i, P, t_m, x_m, y_m,
     
 def clustering(apply_hdbscan,epsilon,minPts,X,Y):
     if apply_hdbscan:
+        import hdbscan  # imported on demand: the import alone takes ~3 s
         db = hdbscan.HDBSCAN(min_cluster_size=minPts, min_samples=minPts)
         idx = db.fit_predict(np.stack((X, Y), axis=-1))
     else:
@@ -118,9 +143,9 @@ def update_cluster(x_m,y_m,t_m,i,X,Y,T,x_clust,y_clust,t_clust,idx,del_,steps,bu
                     y_m[i] = np.append(y_m[i], np.median(Y[idx][mask]))
                     t_m[i] = np.append(t_m[i], np.median(T[idx][mask])* 1e-6)
         else:
-            x_m[i] = np.median(X[idx])
-            y_m[i] = np.median(Y[idx])
-            t_m[i] = np.median(T[idx]) * 1e-6
+            x_m[i] = fast_median(X[idx])
+            y_m[i] = fast_median(Y[idx])
+            t_m[i] = fast_median(T[idx]) * 1e-6
 
         x_clust[i] = np.concatenate([x_clust[i], X[idx]])
         y_clust[i] = np.concatenate([y_clust[i], Y[idx]])

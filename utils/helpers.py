@@ -117,7 +117,8 @@ class EventDataHelper:
         if x_key and y_key and t_key:
             xs = EventDataHelper._flatten_numeric_array(cleaned[x_key])
             ys = EventDataHelper._flatten_numeric_array(cleaned[y_key])
-            ts = EventDataHelper._flatten_numeric_array(cleaned[t_key])
+            # float32 cannot hold microsecond times beyond 16.7 s exactly
+            ts = EventDataHelper._flatten_numeric_array(cleaned[t_key], np.float64)
 
             if xs is not None and ys is not None and ts is not None:
                 size = min(xs.size, ys.size, ts.size)
@@ -153,9 +154,13 @@ class EventDataHelper:
         return None
 
     @staticmethod
-    def _flatten_numeric_array(value: Any) -> Optional[np.ndarray]:
+    def _flatten_numeric_array(value: Any, dtype=None) -> Optional[np.ndarray]:
+        # numeric arrays keep their (compact) dtype unless one is requested; no copy when possible
+        if dtype is None and isinstance(value, np.ndarray) and value.dtype.kind in "iuf":
+            arr = value.ravel()
+            return arr if arr.size else None
         try:
-            arr = np.array(value, dtype=np.float32).ravel()
+            arr = np.asarray(value, dtype=dtype or np.float32).ravel()
         except Exception:
             try:
                 arr = np.array(value).astype(np.float32, copy=False).ravel()

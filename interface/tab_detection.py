@@ -11,6 +11,7 @@ from pathlib import Path
 import math
 import matplotlib.pyplot as plt
 from utils.plots import figure_to_rgba_flat
+from utils.raster import binary_rgba, draw_dots, scalar_rgba
 from matplotlib.colors import ListedColormap
 from datetime import datetime
 import sys, io, contextlib, threading, queue
@@ -798,6 +799,10 @@ class DetectionTab:
             ctx["N"] = 1
             ctx["test_mode"] = True
             ctx["multiN"] = 1
+            # detect in the displayed frame: the plots only show clusters of that frame
+            pt = self.preprocessing_tab
+            if pt is not None and pt.display_t0 is not None:
+                ctx["t_start"] = float(pt.display_t0)
     
         except Exception as e:
             dpg.set_value("det_test_run_status", f"Input error: {e}")
@@ -838,16 +843,7 @@ class DetectionTab:
                 
                 W, H = 1280, 720
                 self._ensure_cluster_texture_size(W, H)
-                dpi = 100
-                fig, ax = plt.subplots(figsize=(W / dpi, H / dpi), dpi=dpi)
-                
-                ax.pcolor(I, cmap="viridis")
-                ax.set_aspect("equal")
-                ax.set_axis_off()
-                fig.tight_layout(pad=0)
-                
-                dpg.set_value(self.cluster_texture_tag, figure_to_rgba_flat(fig))
-                plt.close(fig)
+                self._set_cluster_texture(I, W, H)
                 
                 try:
                     self._on_refresh_plots()
@@ -932,16 +928,7 @@ class DetectionTab:
                 
                 W, H = 1280, 720
                 self._ensure_cluster_texture_size(W, H)
-                dpi = 100
-                fig, ax = plt.subplots(figsize=(W / dpi, H / dpi), dpi=dpi)
-                
-                ax.pcolor(I, cmap="viridis")
-                ax.set_aspect("equal")
-                ax.set_axis_off()
-                fig.tight_layout(pad=0)
-                
-                dpg.set_value(self.cluster_texture_tag, figure_to_rgba_flat(fig))
-                plt.close(fig)
+                self._set_cluster_texture(I, W, H)
                 
                 try:
                     self._update_duration_histogram()
@@ -1002,8 +989,8 @@ class DetectionTab:
         if acc_us <= 0:
             return 1
 
-        tmax = float(np.max(T))
-        tmin = float(np.min(T))
+        tmax = float(T[-1])   # preprocessing keeps the events time sorted
+        tmin = float(T[0])
         N = int(math.ceil((tmax-tmin) / acc_us))
         N = max(1, N)
         return N
@@ -1060,7 +1047,8 @@ class DetectionTab:
                 _, _, Ttmp, _ = ev
                 if Ttmp is None or getattr(Ttmp, "size", len(Ttmp)) == 0:
                     continue
-                sig = (name, int(len(Ttmp)), float(np.max(Ttmp)), float(pt.params.get("accumulation_time_ms", 0)))
+                # cheap signature: this handler runs on every rendered frame while the tab is shown
+                sig = (name, id(Ttmp), int(len(Ttmp)), float(pt.params.get("accumulation_time_ms", 0)))
                 T = Ttmp
                 break
             except Exception:
@@ -1084,19 +1072,19 @@ class DetectionTab:
         if acc_us <= 0:
             return
     
-        tmax = float(np.max(T))
-        tmin = float(np.min(T))
+        tmax = float(T[-1])   # preprocessing keeps the events time sorted
+        tmin = float(T[0])
         new_N = max(1, int(math.ceil((tmax-tmin) / acc_us)))
 
         self.params["N"] = new_N
         if dpg.does_item_exist("det_input_matching_N"):
             dpg.set_value("det_input_matching_N", new_N)
 
-    def _count_events_in_test_step(self, X_global, Y_global, T_global, dt_us: float) -> int:
+    def _count_events_in_test_step(self, X_global, Y_global, T_global, dt_us: float, t_start=None) -> int:
         if T_global is None or len(T_global) == 0:
             return 0
         T = np.asarray(T_global)
-        t_min = float(np.min(T))
+        t_min = float(np.min(T)) if t_start is None else max(float(T[0]), float(t_start))
         mask = (T >= t_min) & (T <= (t_min + float(dt_us)))
         return int(np.count_nonzero(mask))
     
@@ -1138,7 +1126,7 @@ class DetectionTab:
 
         dt_us = float(ctx.get("dt", 0))
         if mode == "test":
-            n_total = self._count_events_in_test_step(X_global, Y_global, T_global, dt_us)
+            n_total = self._count_events_in_test_step(X_global, Y_global, T_global, dt_us, ctx.get("t_start"))
         else:
             N = int(ctx.get("N", 1))
             n_total = self._count_events_in_steps(T_global, dt_us, N)
@@ -1188,10 +1176,42 @@ class DetectionTab:
                 valid.append(i)
         return valid   
     
+    def _set_cluster_texture(self, I, W, H):
+        # same picture as pcolor(I, cmap="viridis"): row 0 at the bottom, colours scaled to [min, max]
+        I = np.asarray(I)
+        rgba = np.zeros((H, W, 4), np.float32)
+        img = scalar_rgba(I[::-1])
+        h, w = min(H, img.shape[0]), min(W, img.shape[1])
+        rgba[:h, :w] = img[:h, :w]
+        dpg.set_value(self.cluster_texture_tag, rgba.ravel())
+
+    def _clusters_in_window(self, t_clust, T_min, T_max):
+        """Indices of the clusters with events in [T_min, T_max] (per-cluster time ranges cached)."""
+        cache = getattr(self, "_cluster_trange_cache", None)
+        if cache is None or cache[0] is not t_clust or cache[1] != len(t_clust):
+            n = len(t_clust)
+            tmin = np.full(n, np.inf)
+            tmax = np.full(n, -np.inf)
+            for i, tc in enumerate(t_clust):
+                if tc is None:
+                    continue
+                t = np.asarray(tc, dtype=float).ravel()
+                if t.size == 0:
+                    continue
+                t = t[np.isfinite(t)]
+                if t.size:
+                    tmin[i] = t.min()
+                    tmax[i] = t.max()
+            cache = (t_clust, n, tmin, tmax)
+            self._cluster_trange_cache = cache
+        _, _, tmin, tmax = cache
+        return np.flatnonzero((tmax >= T_min) & (tmin <= T_max))
+
     def _build_cluster_image(self, x_clust, y_clust, t_clust, height, width, T_min, T_max):
-        I = np.zeros((width, height), dtype=np.uint8)  
-    
-        for xc, yc, tc in zip(x_clust, y_clust, t_clust):
+        I = np.zeros((width, height), dtype=np.uint8)
+
+        for ci in self._clusters_in_window(t_clust, T_min, T_max):
+            xc, yc, tc = x_clust[ci], y_clust[ci], t_clust[ci]
             if xc is None or yc is None or tc is None:
                 continue
     
@@ -1288,9 +1308,9 @@ class DetectionTab:
         T_min = float(t0)
         T_max = T_min + step_us
         
-        mask = (T_all > T_min) & (T_all <= T_max)
-        X = X_all[mask].astype(np.int64)
-        Y = Y_all[mask].astype(np.int64)
+        lo, hi = np.searchsorted(T_all, [T_min, T_max], side="right")  # events are time sorted
+        X = X_all[lo:hi].astype(np.int64)
+        Y = Y_all[lo:hi].astype(np.int64)
     
         W, H = self.pseudoframe_dimensions  
         valid = (X >= 0) & (X < W) & (Y >= 0) & (Y < H)
@@ -1309,19 +1329,13 @@ class DetectionTab:
             xs, ys = self._collect_centers_in_window(out, T_min, T_max)
         
     
-        dpi = 100
-        fig, ax = plt.subplots(figsize=(W / dpi, H / dpi), dpi=dpi)
-        ax.pcolor(I, cmap=PSEUDOFRAME_CMAP)
+        # pcolor(I, PSEUDOFRAME_CMAP) + inverted y axis == the image itself, row 0 on top
+        rgba = binary_rgba(I, PSEUDOFRAME_CMAP.colors[0], PSEUDOFRAME_CMAP.colors[-1])
         if bool(self.params.get("show_scatter", False)) and self.last_result is not None:
             if len(xs) > 0:
-                ax.scatter(xs, ys, s=8, c="r", alpha=0.8)
-        ax.invert_yaxis()
-        ax.set_aspect("equal")
-        ax.set_axis_off()
-        fig.tight_layout(pad=0)
+                draw_dots(rgba, xs, ys, radius=2.0, rgb=(1.0, 0.0, 0.0), alpha=0.8)
 
-        dpg.set_value(self._overlay_pseudoframe_texture_tag, figure_to_rgba_flat(fig))
-        plt.close(fig)
+        dpg.set_value(self._overlay_pseudoframe_texture_tag, rgba.ravel())
 
         dpg.configure_item("det_pf_drawimage", texture_tag=self._overlay_pseudoframe_texture_tag)
         
@@ -1407,8 +1421,9 @@ class DetectionTab:
         x_clust = out.x_clust
         y_clust = out.y_clust
         t_clust = out.t_clust
-    
-        for xc, yc, tc in zip(x_clust, y_clust, t_clust):
+
+        for ci in self._clusters_in_window(t_clust, T_min, T_max):
+            xc, yc, tc = x_clust[ci], y_clust[ci], t_clust[ci]
             if xc is None or yc is None or tc is None:
                 continue
     
@@ -1608,16 +1623,7 @@ class DetectionTab:
     
             W, H = 1280, 720
             self._ensure_cluster_texture_size(W, H)
-    
-            dpi = 100
-            fig, ax = plt.subplots(figsize=(W / dpi, H / dpi), dpi=dpi)
-            ax.pcolor(I, cmap="viridis")
-            ax.set_aspect("equal")
-            ax.set_axis_off()
-            fig.tight_layout(pad=0)
-    
-            dpg.set_value(self.cluster_texture_tag, figure_to_rgba_flat(fig))
-            plt.close(fig)
+            self._set_cluster_texture(I, W, H)
     
         except Exception as e:
             self._status_log_append(f"[DETECTION] Refresh cluster plot failed: {e}")
@@ -1627,16 +1633,35 @@ class DetectionTab:
         except Exception as e:
             self._status_log_append(f"[DETECTION] Refresh histogram failed: {e}")
     
-        self._status_log_append("[DETECTION] Refreshed plots.")  
+        self._log_clusters_in_frame()
+        self._status_log_append("[DETECTION] Refreshed plots.")
+
+    def _log_clusters_in_frame(self):
+        # tells why the views can be empty: they only show clusters of the displayed frame
+        out = getattr(self, "last_result", None)
+        pt = self.preprocessing_tab
+        if out is None or pt is None or pt.display_t0 is None or not hasattr(out, "t_clust"):
+            return
+        t0 = float(pt.display_t0)
+        t1 = t0 + float(pt.params.get("accumulation_time_ms", 2.0)) * 1000.0
+        n = len(self._clusters_in_window(out.t_clust, t0, t1))
+        msg = f"[DETECTION] {n} clusters in the displayed frame t = [{t0:.0f} .. {t1:.0f}] us"
+        if n == 0:
+            msg += " (none detected here: use Test run on this frame, or run detection over it)"
+        self._status_log_append(msg)  
         
     def _update_duration_histogram(self):
         if not dpg.does_item_exist(self.duration_hist_texture_tag):
             return
     
         out = getattr(self, "last_result", None)
-    
+        sig = (id(out), self.params.get("detection_method"))
+        if getattr(self, "_duration_hist_sig", None) == sig:
+            return  # the histogram does not depend on the displayed frame
+        self._duration_hist_sig = sig
+
         durations_us = []
-    
+
         if out is not None:
             method = self.params.get("detection_method", "pixelwise extension")
 

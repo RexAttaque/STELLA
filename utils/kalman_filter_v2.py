@@ -1,6 +1,85 @@
 import numpy as np
 from numba import jit
 
+
+# Constant-acceleration Kalman filter with a position measurement (C = [1, 0, 0]) written
+# out in scalars: S = C P C^T + R is a scalar, so there is no matrix inversion, and the
+# 3x3 products are 27 multiply-adds. The generic loops below allocate A, the products and
+# K for every event and call BLAS for each 3x3 product; this version allocates nothing
+# and releases the GIL, so the tracking threads actually run in parallel.
+@jit(nopython=True, cache=True, nogil=True, inline="always")
+def _kf_step(dt, z, x0, x1, x2, p00, p01, p02, p10, p11, p12, p20, p21, p22, Q, R):
+    h = 0.5 * dt * dt
+    # prediction x = A x, P = A P A^T + Q with A = [[1, dt, dt^2/2], [0, 1, dt], [0, 0, 1]]
+    a0 = x0 + dt * x1 + h * x2
+    a1 = x1 + dt * x2
+    a2 = x2
+    m00 = p00 + dt * p10 + h * p20
+    m01 = p01 + dt * p11 + h * p21
+    m02 = p02 + dt * p12 + h * p22
+    m10 = p10 + dt * p20
+    m11 = p11 + dt * p21
+    m12 = p12 + dt * p22
+    q00 = m00 + dt * m01 + h * m02 + Q[0, 0]
+    q01 = m01 + dt * m02 + Q[0, 1]
+    q02 = m02 + Q[0, 2]
+    q10 = m10 + dt * m11 + h * m12 + Q[1, 0]
+    q11 = m11 + dt * m12 + Q[1, 1]
+    q12 = m12 + Q[1, 2]
+    q20 = p20 + dt * p21 + h * p22 + Q[2, 0]
+    q21 = p21 + dt * p22 + Q[2, 1]
+    q22 = p22 + Q[2, 2]
+    # update with the measured position z
+    inv = 1.0 / (q00 + R)
+    k0 = q00 * inv
+    k1 = q10 * inv
+    k2 = q20 * inv
+    r = z - a0
+    f = 1.0 - k0
+    return (a0 + k0 * r, a1 + k1 * r, a2 + k2 * r,
+            f * q00, f * q01, f * q02,
+            q10 - k1 * q00, q11 - k1 * q01, q12 - k1 * q02,
+            q20 - k2 * q00, q21 - k2 * q01, q22 - k2 * q02)
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _is_position_measurement(C):
+    return C.shape[0] == 3 and C[0] == 1.0 and C[1] == 0.0 and C[2] == 0.0
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _kf_both_scalar(x, y, z, start_id, Q, R, P, x_est, Py, y_est, first_dt_from_next,
+                    y_filtered, y_velocity, y_acceleration, z_filtered, z_velocity, z_acceleration):
+    """Runs the x and y filters over measurements start_id..end (times x in us).
+    Returns the final (P, x_est, Py, y_est)."""
+    a0, a1, a2 = x_est[0], x_est[1], x_est[2]
+    p00, p01, p02 = P[0, 0], P[0, 1], P[0, 2]
+    p10, p11, p12 = P[1, 0], P[1, 1], P[1, 2]
+    p20, p21, p22 = P[2, 0], P[2, 1], P[2, 2]
+    b0, b1, b2 = y_est[0], y_est[1], y_est[2]
+    s00, s01, s02 = Py[0, 0], Py[0, 1], Py[0, 2]
+    s10, s11, s12 = Py[1, 0], Py[1, 1], Py[1, 2]
+    s20, s21, s22 = Py[2, 0], Py[2, 1], Py[2, 2]
+    for i in range(start_id, len(x)):
+        idx = i - start_id
+        if i == 0 and first_dt_from_next:
+            dt = (x[1] - x[0]) * 1e-6
+        else:
+            dt = (x[i] - x[i - 1]) * 1e-6
+        a0, a1, a2, p00, p01, p02, p10, p11, p12, p20, p21, p22 = _kf_step(
+            dt, y[i], a0, a1, a2, p00, p01, p02, p10, p11, p12, p20, p21, p22, Q, R)
+        y_filtered[idx] = a0
+        y_velocity[idx] = a1
+        y_acceleration[idx] = a2
+        b0, b1, b2, s00, s01, s02, s10, s11, s12, s20, s21, s22 = _kf_step(
+            dt, z[i], b0, b1, b2, s00, s01, s02, s10, s11, s12, s20, s21, s22, Q, R)
+        z_filtered[idx] = b0
+        z_velocity[idx] = b1
+        z_acceleration[idx] = b2
+    P_out = np.array([[p00, p01, p02], [p10, p11, p12], [p20, p21, p22]])
+    Py_out = np.array([[s00, s01, s02], [s10, s11, s12], [s20, s21, s22]])
+    return P_out, np.array([a0, a1, a2]), Py_out, np.array([b0, b1, b2])
+
 #used
 @jit(nopython=True,cache=True)
 def Kalman_v2_both_optimized(x, y, z, start_id, C, Q, R, P, x_est, Py, y_est, rev):
@@ -70,7 +149,7 @@ def Kalman_v2_both_optimized(x, y, z, start_id, C, Q, R, P, x_est, Py, y_est, re
     return P, x_est, Py, y_est, t_query, x_interp, y_interp, x_interp_v, y_interp_v, x_interp_a, y_interp_a
 
 #used
-@jit(nopython=True,cache=True)
+@jit(nopython=True,cache=True,nogil=True)
 def Kalman_v2_both_buffer_optimized_lightweight_afterwards(x, y, z, start_id, C, Q, R, P, x_est, Py, y_est, rev, dtt,factor):
     n = len(x) - start_id
 
@@ -86,7 +165,12 @@ def Kalman_v2_both_buffer_optimized_lightweight_afterwards(x, y, z, start_id, C,
     I = np.eye(3, dtype=np.float64)
 
     CT = C.T
-    for i in range(start_id, len(x)):
+    fast = _is_position_measurement(C)
+    if fast:
+        P, x_est, Py, y_est = _kf_both_scalar(
+            x, y, z, start_id, Q, R, P, x_est, Py, y_est, True,
+            y_filtered, y_velocity, y_acceleration, z_filtered, z_velocity, z_acceleration)
+    for i in range(start_id, len(x) if not fast else start_id):
         idx = i - start_id
         if i == 0:
             dt = x[1] - x[0]
@@ -202,7 +286,7 @@ def Kalman_v2_both_buffer_optimized_lightweight_afterwards(x, y, z, start_id, C,
     )
 
 #used
-@jit(nopython=True,cache=True)
+@jit(nopython=True,cache=True,nogil=True)
 def Kalman_v2_both_buffer_optimized_afterwards(x, y, z, start_id, C, Q, R, P, x_est, Py, y_est, rev, dtt, factor):
     n = len(x) - start_id
 
@@ -218,9 +302,14 @@ def Kalman_v2_both_buffer_optimized_afterwards(x, y, z, start_id, C, Q, R, P, x_
 
     I = np.eye(3, dtype=np.float64)
     CT = C.T
-    
-    if rev == 0:  
-        for i in range(start_id, len(x)):
+
+    if rev == 0:
+        fast = _is_position_measurement(C)
+        if fast:
+            P, x_est, Py, y_est = _kf_both_scalar(
+                x, y, z, start_id, Q, R, P, x_est, Py, y_est, False,
+                y_filtered, y_velocity, y_acceleration, z_filtered, z_velocity, z_acceleration)
+        for i in range(start_id, len(x) if not fast else start_id):
             idx = i - start_id
             dt = x[i] - x[i-1]  
             dt = dt * 1e-6

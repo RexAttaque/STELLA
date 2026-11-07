@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
+from utils.track_index import tracks_in_window
 
 if TYPE_CHECKING:
     from interface.tab_preprocessing import PreprocessingTab
@@ -708,7 +709,8 @@ class ValidationTab:
         green = (0, 220, 0, 255)
         red = (220, 0, 0, 255)
 
-        for i in range(n_tracks):
+        # only the tracks overlapping the window (time ranges cached per result)
+        for i in tracks_in_window(t_plot, T_min, T_max, n_tracks):
             x = np.asarray(x_plot[i], dtype=float).ravel() - 1.0
             y = np.asarray(y_plot[i], dtype=float).ravel() - 1.0
             t = np.asarray(t_plot[i], dtype=float).ravel()
