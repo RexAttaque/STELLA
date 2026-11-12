@@ -22,8 +22,8 @@ def _load_events_with_metavision(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[int], Optional[int]]:
     # Numba EVT 3.0 decoder, identical events to pyEBIV.loadRaw() + time()/x()/y()/p()
     # but ~10x faster and without converting 100 M events through Python lists.
-    raw = load_raw(file_path)
-    return raw.x, raw.y, raw.t.astype(np.float64), raw.p, raw.width, raw.height
+    raw = load_raw(file_path, t_dtype=np.float64)  # times decoded as float64 (exact): no conversion pass
+    return raw.x, raw.y, raw.t, raw.p, raw.width, raw.height
 
 
 def load_data_file(file_path: str) -> LoadedData:
