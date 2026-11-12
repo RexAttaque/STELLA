@@ -7,6 +7,7 @@ from collections import defaultdict
 from scipy.spatial.distance import pdist, squareform
 from scipy.ndimage import binary_dilation
 import collections
+from pixelwise_numba import PixelwiseTracker, label_events
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
@@ -104,6 +105,13 @@ def _clear_label(labelmap, i_best):
     hit = labelmap[rx, ry] == i_best
     labelmap[rx[hit], ry[hit]] = -1
 
+# compiled association for the pixelwise extension (utils/pixelwise_numba.py, same results as the Python
+# branch below, which still handles the other modes; numba_matching=False forces it)
+_fast_pixelwise = bool(pixelwise_extension and not pseudo_images and not lightweight_mode
+                       and not (max_tracks > 0 and save_mode == False)
+                       and globals().get("numba_matching", True))
+_tracker = None
+
 tic_start_ges = time.time()
 #%% main loop
 for multi in range(multiN):
@@ -124,7 +132,24 @@ for multi in range(multiN):
             Y_flat = Y.ravel()
             T_flat = T.ravel()
         
-        if k == 0:
+        if _fast_pixelwise and k > 0:
+            if _tracker is None:  # takes over the clusters started at step 0
+                _tracker = PixelwiseTracker(height, width, structure, multi == 1, buffer, len(X_global),
+                                            steps, inactive, inactive_k, valid, x_m, y_m, t_m,
+                                            active_pixels, ind_clust)
+            xs = (X - 1).astype(np.int32)
+            ys = (Y - 1).astype(np.int32)
+            if structure.size == 1:  # no dilation: compiled labelling, same labels as scipy below
+                labels_xy, num_regions = label_events(xs, ys, _tracker.pixmap, N_pixelwise)
+            else:
+                orig_mask = np.zeros((height, width), dtype=bool)
+                orig_mask[xs, ys] = True
+                labeled, num_regions = label(_dilate(orig_mask))
+                labels_xy = labeled[xs, ys]
+                region_sizes = np.bincount(labels_xy, minlength=num_regions + 1)
+                labels_xy[~(region_sizes >= N_pixelwise)[labels_xy]] = 0
+            _tracker.step(k, xs, ys, labels_xy, num_regions, X, Y, T, ind_global)
+        elif k == 0:
             if pseudo_images:
                 centroids, coords = analyze_pseudo_image(X,Y,height,width,area,filtersize)            
                 lookup = defaultdict(list)
@@ -712,6 +737,12 @@ for multi in range(multiN):
         if stop_event is not None and stop_event.is_set():
             break
 
+    if _tracker is not None:  # cluster lists and arrays of the pass, as the Python branch leaves them
+        _out = _tracker.export(X_global, Y_global, T_global)
+        x_clust, y_clust, t_clust, ind_clust = _out["x_clust"], _out["y_clust"], _out["t_clust"], _out["ind_clust"]
+        steps, x_m, y_m, t_m, max_tracks = _out["steps"], _out["x_m"], _out["y_m"], _out["t_m"], _out["max_tracks"]
+        _tracker = _out = None
+
     if lightweight_mode==False:
         # for i in range(3):
             x_clust, y_clust, t_clust, steps, ind_clust = repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps,dt)
@@ -750,29 +781,32 @@ for multi in range(multiN):
                         y_clust[i] = np.array([], dtype=int)
                         t_clust[i] = np.array([], dtype=int)
                         ind_clust[i] = np.array([], dtype=int)
-            ind_all = np.concatenate(ind_clust)
-            ind_all = ind_all.astype(int)
-            mask = np.ones(len(X_global), dtype=bool)
-            mask[ind_all] = False
-            X_global = X_global[mask]
-            Y_global = Y_global[mask]
-            T_global = T_global[mask]
+            if multi < multiN - 1:  # the next pass gets the events left (X_global is not used after the last)
+                ind_all = np.concatenate(ind_clust)
+                ind_all = ind_all.astype(int)
+                mask = np.ones(len(X_global), dtype=bool)
+                mask[ind_all] = False
+                X_global = X_global[mask]
+                Y_global = Y_global[mask]
+                T_global = T_global[mask]
             
-            
-            x_clust_fast = [arr.copy() for arr in x_clust]
-            y_clust_fast = [arr.copy() for arr in y_clust]
-            t_clust_fast = [arr.copy() for arr in t_clust]
-            ind_clust_fast = [arr.copy() for arr in ind_clust]
+            # the lists are handed over as they are (they were copied array by array: same values, but the
+            # whole detection result twice in memory); x_clust & co. get new lists just below
+            x_clust_fast = x_clust
+            y_clust_fast = y_clust
+            t_clust_fast = t_clust
+            ind_clust_fast = ind_clust
             
             if multirun:
                 dt = multitimefactor*dt
                 N = int(N//multitimefactor)
                 minPts = minPts*multitimefactor
             
-            x_clust = [np.array([]) for _ in range(max_tracks)]
-            y_clust = [np.array([]) for _ in range(max_tracks)]
-            t_clust = [np.array([]) for _ in range(max_tracks)]
-            ind_clust = [np.array([]) for _ in range(max_tracks)]
+            # one shared empty array per list: a size-0 array cannot be changed in place, slots are reassigned
+            x_clust = [np.array([])] * max_tracks
+            y_clust = [np.array([])] * max_tracks
+            t_clust = [np.array([])] * max_tracks
+            ind_clust = [np.array([])] * max_tracks
             active_pixels = [[] for _ in range(max_tracks)]
             x_est = [[] for _ in range(max_tracks)]
             y_est = [[] for _ in range(max_tracks)]

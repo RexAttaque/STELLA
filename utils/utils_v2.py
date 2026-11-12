@@ -9,7 +9,7 @@ from skimage.filters import threshold_otsu
 from contextlib import contextmanager
 from joblib.parallel import BatchCompletionCallBack
 from joblib import Parallel
-from numba import njit
+from numba import njit, prange
 
 
 @njit(cache=True, nogil=True)
@@ -340,7 +340,135 @@ def tqdm_joblib(tqdm_object):
         Parallel.__init__.__globals__['BatchCompletionCallBack'] = old_callback
         tqdm_object.close()           
 
+@njit(cache=True, nogil=True)
+def _nanmedian_where(v, t, thr, below, buf):
+    """np.nanmedian(v[t < thr]) (below) or np.nanmedian(v[t > thr]); NaN when nothing is selected."""
+    m = 0
+    for i in range(t.size):
+        if (t[i] < thr) if below else (t[i] > thr):
+            if v[i] == v[i]:  # not NaN
+                buf[m] = v[i]
+                m += 1
+    if m == 0:
+        return np.nan
+    b = buf[:m]
+    b.sort()
+    h = m // 2
+    if m % 2:
+        return b[h]
+    return (b[h - 1] + b[h]) / 2.0
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _track_ends(x, y, t, off, ids, dt, t_s, t_e, x_s, y_s, x_e, y_e):
+    """t_s, t_e, x_s, y_s, x_e, y_e of repair_tracks for clusters ids (events x[off[c]:off[c + 1]], ...)."""
+    for c in prange(ids.size):
+        a = off[c]
+        b = off[c + 1]
+        buf = np.empty(b - a)
+        xc = x[a:b]
+        allnan = True  # the original skips clusters whose x are all NaN
+        for v in xc:
+            if v == v:
+                allnan = False
+                break
+        if allnan:
+            continue
+        i = ids[c]
+        tc = t[a:b]
+        t_s[i] = np.min(tc) + dt
+        t_e[i] = np.max(tc) - dt
+        x_s[i] = _nanmedian_where(xc, tc, t_s[i], True, buf)
+        y_s[i] = _nanmedian_where(y[a:b], tc, t_s[i], True, buf)
+        x_e[i] = _nanmedian_where(xc, tc, t_e[i], False, buf)
+        y_e[i] = _nanmedian_where(y[a:b], tc, t_e[i], False, buf)
+
+
+@njit(cache=True, nogil=True)
+def _link_tracks(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e, rank, dt, max_dtt, r, n):
+    """Links of repair_tracks: for every start (ascending), the first end within r (in cKDTree order = ascending
+    rank) that is not the track itself, not used yet and 0 < |(t_s - dt) - (t_e + dt)| <= max_dtt.
+
+    Ends are found through a (time, x, y) grid instead of the ball query: an end can only link if
+    t_e is in [t_s - 3 dt, t_s - dt], so only a few grid rows are searched.
+    """
+    ne = ends.size
+    lt = np.empty(targets.size, np.int64)
+    ls = np.empty(targets.size, np.int64)
+    if ne == 0 or targets.size == 0:
+        return lt[:0], ls[:0]
+    tb = np.empty(ne, np.int64)
+    cx = np.empty(ne, np.int64)
+    cy = np.empty(ne, np.int64)
+    for j in range(ne):
+        e = ends[j]
+        tb[j] = np.int64(np.floor(t_e[e] / dt))
+        cx[j] = np.int64(np.floor(x_e[e] / r))
+        cy[j] = np.int64(np.floor(y_e[e] / r))
+    tb0 = tb.min()
+    tb1 = tb.max()
+    cx0 = cx.min()
+    cy0 = cy.min()
+    ncx = cx.max() - cx0 + 1
+    ncy = cy.max() - cy0 + 1
+    key = np.empty(ne, np.int64)
+    for j in range(ne):
+        key[j] = ((tb[j] - tb0) * ncx + (cx[j] - cx0)) * ncy + (cy[j] - cy0)
+    order = np.argsort(key)
+    skey = key[order]
+    used = np.zeros(n, np.bool_)
+    r2 = r * r
+    nl = 0
+    for q in range(targets.size):
+        tgt = targets[q]
+        xs = x_s[tgt]
+        ys = y_s[tgt]
+        # generous bounds (one row / cell more on each side): the exact tests below decide
+        b_lo = max(np.int64(np.floor((t_s[tgt] - 3 * dt) / dt)) - 1, tb0)
+        b_hi = min(np.int64(np.floor((t_s[tgt] - dt) / dt)) + 1, tb1)
+        qx = np.int64(np.floor(xs / r))
+        qy = np.int64(np.floor(ys / r))
+        y_lo = max(qy - 1, cy0) - cy0
+        y_hi = min(qy + 1, cy0 + ncy - 1) - cy0
+        best = -1
+        best_rank = np.iinfo(np.int64).max
+        if y_lo <= y_hi:
+            for b in range(b_lo, b_hi + 1):
+                for gx in range(max(qx - 1, cx0), min(qx + 1, cx0 + ncx - 1) + 1):
+                    row = ((b - tb0) * ncx + (gx - cx0)) * ncy
+                    p = np.searchsorted(skey, row + y_lo)
+                    while p < ne and skey[p] <= row + y_hi:
+                        j = order[p]
+                        p += 1
+                        if rank[j] >= best_rank:
+                            continue
+                        src = ends[j]
+                        if src == tgt or used[src]:
+                            continue
+                        dx = xs - x_e[src]
+                        dy = ys - y_e[src]
+                        if dx * dx + dy * dy > r2:
+                            continue
+                        time_diff = abs((t_s[tgt] - dt) - (t_e[src] + dt))
+                        if not (0 < time_diff <= max_dtt):
+                            continue
+                        best = src
+                        best_rank = rank[j]
+        if best >= 0:
+            lt[nl] = tgt
+            ls[nl] = best
+            nl += 1
+            used[best] = True
+    return lt[:nl], ls[:nl]
+
+
 def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
+    """Joins a track that starts where (and right after) another one ends.
+
+    Same links and results as the original per-cluster numpy version: the start / end medians are compiled
+    (clusters taken in chunks), and the first acceptable neighbour of the ball query is found through a time / space
+    grid, in the order cKDTree would list it (its traversal returns points in the order of tree.indices).
+    """
     n = len(x_clust)
 
     x_s = np.full(n, np.nan)
@@ -350,23 +478,19 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
     t_s = np.zeros(n)
     t_e = np.zeros(n)
 
-    for i in range(n):
-        if len(x_clust[i]) == 0 or np.isnan(x_clust[i]).all():
-            continue
-
-        t_s[i] = np.min(t_clust[i]) + dt
-        t_e[i] = np.max(t_clust[i]) - dt
-
-        mask_start = t_clust[i] < t_s[i]
-        mask_end   = t_clust[i] > t_e[i]
-
-        if np.any(mask_start):
-            x_s[i] = np.nanmedian(x_clust[i][mask_start])
-            y_s[i] = np.nanmedian(y_clust[i][mask_start])
-
-        if np.any(mask_end):
-            x_e[i] = np.nanmedian(x_clust[i][mask_end])
-            y_e[i] = np.nanmedian(y_clust[i][mask_end])
+    lens = np.fromiter((len(a) for a in x_clust), np.int64, n)
+    ids = np.flatnonzero(lens)
+    a = 0
+    while a < ids.size:  # chunks of ~20 M events: bounded memory, one compiled call each
+        b = a + int(np.searchsorted(np.cumsum(lens[ids[a:a + 1_000_000]]), 20_000_000, side="right"))
+        b = min(max(b, a + 1), ids.size)
+        sel = ids[a:b]
+        off = np.concatenate(([0], np.cumsum(lens[sel])))
+        xs = np.concatenate([np.asarray(x_clust[i]) for i in sel.tolist()])
+        ys = np.concatenate([np.asarray(y_clust[i]) for i in sel.tolist()])
+        ts = np.concatenate([np.asarray(t_clust[i]) for i in sel.tolist()])
+        _track_ends(xs, ys, ts, off, sel, float(dt), t_s, t_e, x_s, y_s, x_e, y_e)
+        a = b
 
     max_dtt  = dt
     max_dist = 5
@@ -375,36 +499,17 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
     end_points = np.column_stack((x_e[valid_end], y_e[valid_end]))
     end_indices = np.where(valid_end)[0]
 
-    tree = cKDTree(end_points)
+    targets = np.flatnonzero(~np.isnan(x_s) & ~np.isnan(y_s))
+    if targets.size == 0 or end_indices.size == 0 or not dt > 0:
+        links_t = links_s = np.zeros(0, np.int64)
+    else:
+        tree = cKDTree(end_points)  # built as before: its point order decides between candidates
+        rank = np.empty(end_indices.size, np.int64)
+        rank[tree.indices] = np.arange(end_indices.size)
+        links_t, links_s = _link_tracks(targets, x_s, y_s, t_s, end_indices, x_e, y_e, t_e, rank,
+                                        float(dt), float(max_dtt), float(max_dist), n)
 
-    used_sources = set()
-    used_targets = set()
-    links = []
-
-    for tgt in range(n):
-        if np.isnan(x_s[tgt]) or np.isnan(y_s[tgt]):
-            continue
-        if tgt in used_targets:
-            continue
-
-        neigh = tree.query_ball_point([x_s[tgt], y_s[tgt]], r=max_dist)
-
-        for k in neigh:
-            src = end_indices[k]
-
-            if src == tgt:
-                continue
-            if src in used_sources:
-                continue
-            time_diff = abs((t_s[tgt] - dt) - (t_e[src] + dt))
-            if not (0 < time_diff <= max_dtt):
-                continue
-
-            links.append((tgt, src))
-            used_targets.add(tgt)
-            used_sources.add(src)
-            break  
-    for idx_target, idx_source in links:
+    for idx_target, idx_source in zip(links_t.tolist(), links_s.tolist()):
         if len(x_clust[idx_source]) == 0:
             continue
 
