@@ -1,12 +1,11 @@
 import numpy as np
 from sklearn.cluster import DBSCAN
 from scipy.spatial.distance import cdist
-from scipy.spatial import KDTree, cKDTree
+from scipy.spatial import KDTree
 from scipy.ndimage import convolve
 from skimage.measure import label, regionprops
 from scipy.optimize import linear_sum_assignment
 from skimage.filters import threshold_otsu
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from joblib.parallel import BatchCompletionCallBack
 from joblib import Parallel
@@ -474,18 +473,29 @@ def _link_candidates(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e, dt, max_dtt, r
 
 
 @njit(cache=True, nogil=True)
-def _pick_links(targets, off, cand, rank, n):
-    """For every start (ascending), its candidate of lowest rank whose end is not used yet; each end links once."""
+def _pick_links(targets, off, cand, d2, t_s, t_e, dt, n):
+    """For every start (ascending), its nearest candidate whose end is not used yet; each end links once.
+
+    Ties: the smaller time gap |(t_s - dt) - (t_e + dt)|, then the lower track index.
+    """
     lt = np.empty(targets.size, np.int64)
     ls = np.empty(targets.size, np.int64)
     used = np.zeros(n, np.bool_)
     nl = 0
     for q in range(targets.size):
+        t0 = t_s[targets[q]] - dt
         best = -1
+        bd = 0.0
+        bt = 0.0
         for c in range(off[q], off[q + 1]):
             src = cand[c]
-            if not used[src] and (best < 0 or rank[src] < rank[best]):
+            if used[src]:
+                continue
+            tg = abs(t0 - (t_e[src] + dt))
+            if best < 0 or d2[c] < bd or (d2[c] == bd and (tg < bt or (tg == bt and src < best))):
                 best = src
+                bd = d2[c]
+                bt = tg
         if best >= 0:
             lt[nl] = targets[q]
             ls[nl] = best
@@ -497,27 +507,19 @@ def _pick_links(targets, off, cand, rank, n):
 def _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt):
     """(targets, sources) of repair_tracks, in the order the links are applied.
 
-    As the original ball query: every start takes the first acceptable end in cKDTree order (the order of
-    tree.indices). The tree is only built for that order, in a thread while the candidates are searched.
+    Every start (ascending track index) links to the nearest end within max_dist that is not used yet. The original
+    took the first acceptable end of a cKDTree ball query, whose order is the tree's internal point order.
     """
     max_dtt  = dt
     max_dist = 5
 
-    valid_end = ~np.isnan(x_e) & ~np.isnan(y_e)
-    end_points = np.column_stack((x_e[valid_end], y_e[valid_end]))
-    end_indices = np.where(valid_end)[0]
-
+    ends = np.flatnonzero(~np.isnan(x_e) & ~np.isnan(y_e))
     targets = np.flatnonzero(~np.isnan(x_s) & ~np.isnan(y_s))
-    if targets.size == 0 or end_indices.size == 0 or not dt > 0:
+    if targets.size == 0 or ends.size == 0 or not dt > 0:
         return np.zeros(0, np.int64), np.zeros(0, np.int64)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        tree = pool.submit(cKDTree, end_points)  # the build releases the GIL
-        off, cand, _ = _link_candidates(targets, x_s, y_s, t_s, end_indices, x_e, y_e, t_e,
-                                        float(dt), float(max_dtt), float(max_dist))
-        tree = tree.result()
-    rank = np.empty(n, np.int64)  # by track index
-    rank[end_indices[tree.indices]] = np.arange(end_indices.size)
-    return _pick_links(targets, off, cand, rank, n)
+    off, cand, d2 = _link_candidates(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e,
+                                     float(dt), float(max_dtt), float(max_dist))
+    return _pick_links(targets, off, cand, d2, t_s, t_e, float(dt), n)
 
 
 @njit(cache=True, nogil=True)
@@ -601,9 +603,9 @@ def repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt):
 def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
     """Joins a track that starts where (and right after) another one ends.
 
-    Same links and results as the original per-cluster numpy version: the start / end medians are compiled
-    (clusters taken in chunks), and the first acceptable neighbour of the ball query is found through a time / space
-    grid (_find_links), in the order cKDTree would list it (its traversal returns points in the order of tree.indices).
+    Same start / end medians as the original per-cluster numpy version (compiled, clusters taken in chunks). Every
+    start links to its nearest acceptable end (_find_links); the original took the first one in cKDTree order, an
+    arbitrary choice when several ends qualify.
     """
     if isinstance(x_clust, PackedTracks):
         return repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt)

@@ -1,4 +1,4 @@
-# Performance work in this fork (`performance`, `numba_convert` and `flat-array_and_optim` branches)
+# Performance work in this fork (`performance`, `numba_convert`, `flat-array_and_optim` and `KD_tree_replace` branches)
 
 STELLA was very slow on real recordings: stepping through the pseudo-frames of a few-seconds recording took
 minutes, and a full detection run could take hours or fail. This branch profiles and optimises it without changing
@@ -57,6 +57,26 @@ the pass from ~50 s to ~17 s. GUI work on a result with 57 900 tracks (the facto
 | Cluster order of the tracking tab | 0.2 s | 0.002 s |
 | Pickling the result for *Save results* | 0.42 s | 0.01 s |
 
+### `KD_tree_replace` branch: track-repair links without a KD-tree
+
+`repair_tracks` joins a track that starts where, and right after, another one ends. When several track ends
+qualify for the same start, the original takes the first one returned by a `cKDTree` ball query. That order is the
+tree's internal point order, so the choice between them is arbitrary. This branch links every start to the
+**nearest** qualifying end instead (then the smaller time gap, then the lower track index), and searches the
+candidates of all starts in parallel. The tree is no longer built.
+
+| Large recording (553 M events) | `flat-array_and_optim` | `KD_tree_replace` |
+|---|---|---|
+| Link search (end of pass + final repair) | 3.4 s + 2.5 s | 0.75 s + 0.56 s |
+| Whole detection (3 runs each; full runs vary by several seconds on this machine) | 52.0-58.7 s | 47.6 s |
+
+The tracks change where a start had several candidates: 0.03 % of the tracks on the 96 M-event recording and
+1.1 % on the 553 M-event one (26 000 of 2.3 million tracks, 1.9 % of the events). Where the two rules pick
+different ends, the joined start and end are 3.1 px apart on average instead of 4.3 px.
+
+The first commit of the branch (`ff0de96`, "Search track-repair links in parallel") keeps the tree order and
+identical results, with the link search at 1.3 s + 0.9 s.
+
 ## Verification
 
 - `.raw` decoding gives exactly the same events as pyEBIV (all 96 170 404 events compared).
@@ -72,6 +92,9 @@ the pass from ~50 s to ~17 s. GUI work on a result with 57 900 tracks (the facto
   float64 by concatenating them with an emptied `np.array([])` (2625 of 2.3 million on the large recording) keep
   the dtype of the others (uint16 coordinates, int64 indices). The GUI statistics, frame index, duration
   histogram and cluster order, and the Kalman tracking, give identical results from flat arrays and from lists.
+- `KD_tree_replace`: the link search gives the same links as a brute-force nearest-first search on 300 random
+  cases (149 000 links), and the list and flat-array versions of `repair_tracks` give identical tracks. Its first
+  commit (tree order kept) gives outputs identical to `flat-array_and_optim` in every mode listed above.
 - Tracking: Kalman filter identical within 1e-8 relative, B-spline identical, hybrid within 2e-7 relative
   (floating-point summation order).
 
@@ -138,6 +161,11 @@ the pass from ~50 s to ~17 s. GUI work on a result with 57 900 tracks (the facto
 - Results saved with *Save results* store `PackedTracks` and need this branch to load (`utils/packed_tracks.py`);
   older files load as before.
 
+**Track-repair links, `KD_tree_replace` branch** (`utils/utils_v2.py`)
+- `_link_candidates` lists, for every track start in parallel, the track ends within 5 px whose timing allows a
+  link, through the same time / space grid as before. `_pick_links` then takes the starts in ascending order and
+  links each one to its nearest end that is not used yet. `cKDTree` is no longer imported.
+
 **Tracking** (`utils/kalman_filter_v2.py`, `interface/tab_tracking.py`, `interface/tab_validation.py`)
 - The Kalman filter measures position only (C = [1, 0, 0]), so the innovation covariance is a scalar: a scalar
   numba step replaces the matrix inversion (the general path is kept for other models).
@@ -172,5 +200,5 @@ To update an existing STELLA clone to one of these branches:
 ```
 git remote add fork https://github.com/RexAttaque/STELLA.git
 git fetch fork
-git checkout -b performance fork/performance       # or numba_convert, or flat-array_and_optim
+git checkout -b performance fork/performance       # or numba_convert, flat-array_and_optim, KD_tree_replace
 ```
