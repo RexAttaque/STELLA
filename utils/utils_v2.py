@@ -10,6 +10,10 @@ from contextlib import contextmanager
 from joblib.parallel import BatchCompletionCallBack
 from joblib import Parallel
 from numba import njit, prange
+try:
+    from utils.packed_tracks import PackedTracks, _gather_chains
+except ImportError:  # run with only utils/ on the path
+    from packed_tracks import PackedTracks, _gather_chains
 
 
 @njit(cache=True, nogil=True)
@@ -360,11 +364,11 @@ def _nanmedian_where(v, t, thr, below, buf):
 
 
 @njit(cache=True, nogil=True, parallel=True)
-def _track_ends(x, y, t, off, ids, dt, t_s, t_e, x_s, y_s, x_e, y_e):
-    """t_s, t_e, x_s, y_s, x_e, y_e of repair_tracks for clusters ids (events x[off[c]:off[c + 1]], ...)."""
+def _track_ends(x, y, t, lo, hi, ids, dt, t_s, t_e, x_s, y_s, x_e, y_e):
+    """t_s, t_e, x_s, y_s, x_e, y_e of repair_tracks for clusters ids (events x[lo[c]:hi[c]], ...)."""
     for c in prange(ids.size):
-        a = off[c]
-        b = off[c + 1]
+        a = lo[c]
+        b = hi[c]
         buf = np.empty(b - a)
         xc = x[a:b]
         allnan = True  # the original skips clusters whose x are all NaN
@@ -462,6 +466,103 @@ def _link_tracks(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e, rank, dt, max_dtt,
     return lt[:nl], ls[:nl]
 
 
+def _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt):
+    """(targets, sources) of repair_tracks, in the order the links are applied."""
+    max_dtt  = dt
+    max_dist = 5
+
+    valid_end = ~np.isnan(x_e) & ~np.isnan(y_e)
+    end_points = np.column_stack((x_e[valid_end], y_e[valid_end]))
+    end_indices = np.where(valid_end)[0]
+
+    targets = np.flatnonzero(~np.isnan(x_s) & ~np.isnan(y_s))
+    if targets.size == 0 or end_indices.size == 0 or not dt > 0:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    tree = cKDTree(end_points)  # built as before: its point order decides between candidates
+    rank = np.empty(end_indices.size, np.int64)
+    rank[tree.indices] = np.arange(end_indices.size)
+    return _link_tracks(targets, x_s, y_s, t_s, end_indices, x_e, y_e, t_e, rank,
+                        float(dt), float(max_dtt), float(max_dist), n)
+
+
+@njit(cache=True, nogil=True)
+def _apply_links(links_t, links_s, lens, steps):
+    """The link loop of repair_tracks on chains of tracks instead of concatenated arrays.
+
+    Output track i holds input tracks head[i], nxt[head[i]], ... in order (head -1: emptied). Same order as the
+    list version: a target gets the current content of its source appended, the source is emptied; a link whose
+    source is already empty is skipped. steps is updated in place, as before.
+    """
+    n = lens.size
+    head = np.arange(n)
+    tail = np.arange(n)
+    nxt = np.full(n, -1, np.int64)
+    clen = lens.copy()
+    for q in range(links_t.size):
+        tg = links_t[q]
+        sc = links_s[q]
+        if clen[sc] == 0:
+            continue
+        if head[tg] == -1:
+            head[tg] = head[sc]
+        else:
+            nxt[tail[tg]] = head[sc]
+        tail[tg] = tail[sc]
+        clen[tg] += clen[sc]
+        head[sc] = -1
+        tail[sc] = -1
+        clen[sc] = 0
+        steps[tg] += steps[sc]
+        steps[sc] = 0
+    return head, nxt, clen
+
+
+def repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt):
+    """repair_tracks for PackedTracks (utils/packed_tracks.py): same links and same track contents.
+
+    The four collections are updated in place, like the lists, and returned. The track ends are computed directly
+    on the flat arrays and every linked track is written once (no repeated concatenation). Tracks keep the dtype
+    of their collection: the list version turned a few of them into float64 (concatenation with an emptied
+    np.array([])), with the same values.
+    """
+    fields = (x_clust, y_clust, t_clust, ind_clust)
+    n = len(x_clust)
+    lens = x_clust.lengths()
+    for f in fields[1:]:
+        if len(f) != n or not np.array_equal(f.lengths(), lens):
+            raise ValueError("repair_tracks_packed: x, y, t and ind must hold tracks of the same lengths")
+
+    x_s = np.full(n, np.nan)
+    y_s = np.full(n, np.nan)
+    x_e = np.full(n, np.nan)
+    y_e = np.full(n, np.nan)
+    t_s = np.zeros(n)
+    t_e = np.zeros(n)
+    ids = np.flatnonzero(lens)
+    if ids.size:
+        if not (x_clust.start is y_clust.start is t_clust.start and x_clust.stop is y_clust.stop is t_clust.stop):
+            if not (np.array_equal(x_clust.start, y_clust.start) and np.array_equal(x_clust.start, t_clust.start)):
+                raise ValueError("repair_tracks_packed: x, y and t must share their track ranges")
+        _track_ends(x_clust.data, y_clust.data, t_clust.data, x_clust.start[ids], x_clust.stop[ids], ids,
+                    float(dt), t_s, t_e, x_s, y_s, x_e, y_e)
+
+    links_t, links_s = _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt)
+    if links_t.size == 0:
+        return x_clust, y_clust, t_clust, steps, ind_clust
+    if max(int(links_t.max()), int(links_s.max())) >= len(steps):
+        raise IndexError("repair_tracks: track index out of range of steps")
+
+    head, nxt, clen = _apply_links(links_t, links_s, lens, steps)
+    off = np.zeros(n + 1, np.int64)
+    np.cumsum(clen, out=off[1:])
+    start, stop = off[:-1], off[1:]
+    for f in fields:  # one collection at a time: its old flat array is freed before the next one is built
+        out = np.empty(off[-1], f.data.dtype)
+        _gather_chains(f.data, f.start, f.stop, head, nxt, off, out)
+        f.data, f.start, f.stop = out, start, stop
+    return x_clust, y_clust, t_clust, steps, ind_clust
+
+
 def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
     """Joins a track that starts where (and right after) another one ends.
 
@@ -469,6 +570,8 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
     (clusters taken in chunks), and the first acceptable neighbour of the ball query is found through a time / space
     grid, in the order cKDTree would list it (its traversal returns points in the order of tree.indices).
     """
+    if isinstance(x_clust, PackedTracks):
+        return repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt)
     n = len(x_clust)
 
     x_s = np.full(n, np.nan)
@@ -489,25 +592,10 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
         xs = np.concatenate([np.asarray(x_clust[i]) for i in sel.tolist()])
         ys = np.concatenate([np.asarray(y_clust[i]) for i in sel.tolist()])
         ts = np.concatenate([np.asarray(t_clust[i]) for i in sel.tolist()])
-        _track_ends(xs, ys, ts, off, sel, float(dt), t_s, t_e, x_s, y_s, x_e, y_e)
+        _track_ends(xs, ys, ts, off[:-1], off[1:], sel, float(dt), t_s, t_e, x_s, y_s, x_e, y_e)
         a = b
 
-    max_dtt  = dt
-    max_dist = 5
-
-    valid_end = ~np.isnan(x_e) & ~np.isnan(y_e)
-    end_points = np.column_stack((x_e[valid_end], y_e[valid_end]))
-    end_indices = np.where(valid_end)[0]
-
-    targets = np.flatnonzero(~np.isnan(x_s) & ~np.isnan(y_s))
-    if targets.size == 0 or end_indices.size == 0 or not dt > 0:
-        links_t = links_s = np.zeros(0, np.int64)
-    else:
-        tree = cKDTree(end_points)  # built as before: its point order decides between candidates
-        rank = np.empty(end_indices.size, np.int64)
-        rank[tree.indices] = np.arange(end_indices.size)
-        links_t, links_s = _link_tracks(targets, x_s, y_s, t_s, end_indices, x_e, y_e, t_e, rank,
-                                        float(dt), float(max_dtt), float(max_dist), n)
+    links_t, links_s = _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt)
 
     for idx_target, idx_source in zip(links_t.tolist(), links_s.tolist()):
         if len(x_clust[idx_source]) == 0:

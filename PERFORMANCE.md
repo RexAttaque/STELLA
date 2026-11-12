@@ -1,4 +1,4 @@
-# Performance work in this fork (`performance` and `numba_convert` branches)
+# Performance work in this fork (`performance`, `numba_convert` and `flat-array_and_optim` branches)
 
 STELLA was very slow on real recordings: stepping through the pseudo-frames of a few-seconds recording took
 minutes, and a full detection run could take hours or fail. This branch profiles and optimises it without changing
@@ -34,6 +34,29 @@ Measured with Python 3.12, numpy 2.5, numba 0.68, scipy 1.18 on an 8-core / 16-t
 Per 2 ms step on the 553 M-event recording (~130 000 events, ~5000 regions): 374 ms before, ~10 ms now. Multi-run
 and larger mask sizes (dilated regions) are 3-14x faster; the DBSCAN and pseudo-frame methods are unchanged.
 
+### `flat-array_and_optim` branch: flat track arrays
+
+The detection result held each quantity (`x_clust`, `y_clust`, `t_clust`, `ind_clust`) as a Python list of one
+numpy array per track: 3.2 million slots and 2.3 million final tracks on the large recording. Every pass over all
+tracks (end of pass, `repair_tracks`, the GUI statistics, saving) paid Python's per-object cost. The tracks are now
+stored back to back in one flat array per quantity (`PackedTracks`), and the labelling of the next time step runs
+in a second thread while the current one is matched. Both columns measured back to back on the same machine:
+
+| Detection, whole recording (pixelwise extension, GUI defaults) | `numba_convert` | `flat-array_and_optim` |
+|---|---|---|
+| 96 M events, 7682 steps (`_1.raw`) | 12.3 s, 2.5 GB peak | 7.3 s, 2.5 GB peak |
+| 553 M events, 5988 steps (1.5 GB) | 87.8 s, 21.1 GB peak | 52.0 s, 17.0 GB peak |
+
+On the large recording: the time steps went from 8.7 to 6.4 ms each (labelling overlapped, ~14 s) and the end of
+the pass from ~50 s to ~17 s. GUI work on a result with 57 900 tracks (the factor grows with the number of tracks):
+
+| | lists | flat arrays |
+|---|---|---|
+| Detection statistics (Run detection / Test run) | 1.3 s | 0.14 s |
+| Clusters of the displayed frame (first call, builds the time index) | 0.13 s | 0.013 s |
+| Cluster order of the tracking tab | 0.2 s | 0.002 s |
+| Pickling the result for *Save results* | 0.42 s | 0.01 s |
+
 ## Verification
 
 - `.raw` decoding gives exactly the same events as pyEBIV (all 96 170 404 events compared).
@@ -43,6 +66,12 @@ and larger mask sizes (dilated regions) are 3-14x faster; the DBSCAN and pseudo-
   `t_m`: dtype, length and bytes of every array) is identical to the `performance` branch on both whole recordings
   above, with multi-run, with mask sizes 2 and 3, and with the DBSCAN and pseudo-frame methods. The compiled
   labelling, median and track-linking kernels were also checked against scipy / numpy on thousands of random cases.
+- `flat-array_and_optim`: every track of every detection output holds the same values as on `numba_convert`
+  (both whole recordings, multi-run, mask sizes 2 and 3; DBSCAN, pseudo-frame and `numba_matching=False`, which
+  keep lists, are identical including dtypes). The only difference: tracks that the list version turned into
+  float64 by concatenating them with an emptied `np.array([])` (2625 of 2.3 million on the large recording) keep
+  the dtype of the others (uint16 coordinates, int64 indices). The GUI statistics, frame index, duration
+  histogram and cluster order, and the Kalman tracking, give identical results from flat arrays and from lists.
 - Tracking: Kalman filter identical within 1e-8 relative, B-spline identical, hybrid within 2e-7 relative
   (floating-point summation order).
 
@@ -90,6 +119,25 @@ and larger mask sizes (dilated regions) are 3-14x faster; the DBSCAN and pseudo-
   lists are reset with a shared empty array and handed over without copying every cluster (millions of slots on
   long recordings).
 
+**Flat track arrays, `flat-array_and_optim` branch** (`utils/packed_tracks.py`, new; `utils/detection.py`,
+`utils/pixelwise_numba.py`, `utils/utils_v2.py`, `interface/tab_detection.py`, `interface/tab_tracking.py`)
+- `PackedTracks`: one flat array plus the [start, stop) range of every track. It behaves like the list it
+  replaces (`len`, `x[i]` returns a view, iteration, replacing a track by values of the same length), so code
+  written for lists keeps working; whole-collection operations (lengths, filters, per-track min / max / counts,
+  distinct values) are vectorised or compiled. Pickling stores it compactly.
+- The pixelwise-extension detection produces `PackedTracks` directly from the tracker: the end-of-pass filters
+  only change ranges, `repair_tracks` works on the flat arrays (track ends computed in place, every linked track
+  written once, same links and contents as the list version) and the final result is compact. The other methods
+  still return lists.
+- The time window and labelling of step k + 1 are prepared in a worker thread while step k is matched (the
+  compiled labelling releases the GIL).
+- GUI: the detection statistics, the per-frame cluster index, the duration histogram and the tracking-tab cluster
+  order use the flat arrays; lists (results of the other methods, files saved before) take the previous code.
+  The tracking script gets lists of track views (it indexes every track many times from several threads, which is
+  ~20x faster on a list), so tracking no longer re-sorts the detection result in place as a side effect.
+- Results saved with *Save results* store `PackedTracks` and need this branch to load (`utils/packed_tracks.py`);
+  older files load as before.
+
 **Tracking** (`utils/kalman_filter_v2.py`, `interface/tab_tracking.py`, `interface/tab_validation.py`)
 - The Kalman filter measures position only (C = [1, 0, 0]), so the innovation covariance is a scalar: a scalar
   numba step replaces the matrix inversion (the general path is kept for other models).
@@ -124,5 +172,5 @@ To update an existing STELLA clone to one of these branches:
 ```
 git remote add fork https://github.com/RexAttaque/STELLA.git
 git fetch fork
-git checkout -b performance fork/performance       # or: git checkout -b numba_convert fork/numba_convert
+git checkout -b performance fork/performance       # or numba_convert, or flat-array_and_optim
 ```

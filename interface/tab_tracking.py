@@ -5,6 +5,12 @@ from matplotlib import colormaps
 import matplotlib.pyplot as plt
 from utils.plots import figure_to_rgba_flat
 from utils.track_index import tracks_in_window
+from utils.packed_tracks import PackedTracks
+
+
+def _track_list(tracks):
+    """Per-track arrays as a list (views of the flat array for PackedTracks)."""
+    return list(tracks) if isinstance(tracks, PackedTracks) else tracks
 import dearpygui.dearpygui as dpg
 import numpy as np
 import pickle
@@ -626,13 +632,20 @@ class TrackingTab:
             self._cluster_signature = None
             return
 
-        sizes = []
-        for i, xc in enumerate(x_src):
-            sizes.append((self._count_non_nan(xc), i))
-        sizes.sort(reverse=True, key=lambda p: p[0])
-        self._cluster_sorted_idx = [i for _, i in sizes if _ > 0]
-        if not self._cluster_sorted_idx:
-            self._cluster_sorted_idx = [i for _, i in sizes]
+        if isinstance(x_src, PackedTracks):  # same order: most values first, ties by index
+            counts = x_src.count_finite()
+            order = np.argsort(-counts, kind="stable")
+            self._cluster_sorted_idx = order[counts[order] > 0].tolist()
+            if not self._cluster_sorted_idx:
+                self._cluster_sorted_idx = order.tolist()
+        else:
+            sizes = []
+            for i, xc in enumerate(x_src):
+                sizes.append((self._count_non_nan(xc), i))
+            sizes.sort(reverse=True, key=lambda p: p[0])
+            self._cluster_sorted_idx = [i for _, i in sizes if _ > 0]
+            if not self._cluster_sorted_idx:
+                self._cluster_sorted_idx = [i for _, i in sizes]
 
         self._cluster_pos = 0
         self._update_cluster_plot()
@@ -927,7 +940,10 @@ class TrackingTab:
             max_len_data = max((len(a) for a in det_out.t_m), default=0)
         else:
             n_tracks_data = len(det_out.x_clust)
-            max_len_data = max((len(a) for a in det_out.t_clust), default=0)
+            if isinstance(det_out.t_clust, PackedTracks):
+                max_len_data = int(det_out.t_clust.lengths().max()) if len(det_out.t_clust) else 0
+            else:
+                max_len_data = max((len(a) for a in det_out.t_clust), default=0)
 
         user_max_tracks = int(self.params.get("max_tracks", n_tracks_data))
         user_max_length = int(self.params.get("max_length", max_len_data))
@@ -1015,9 +1031,11 @@ class TrackingTab:
             ctx["x_clust"] = det_out.x_clust
             ctx["y_clust"] = det_out.y_clust
         else:
-            ctx["t_clust"] = det_out.t_clust
-            ctx["x_clust"] = det_out.x_clust
-            ctx["y_clust"] = det_out.y_clust
+            # PackedTracks (flat arrays) are handed over as lists of track views: the tracking script indexes
+            # every track many times from several threads, and a list returns them ~20x faster
+            ctx["t_clust"] = _track_list(det_out.t_clust)
+            ctx["x_clust"] = _track_list(det_out.x_clust)
+            ctx["y_clust"] = _track_list(det_out.y_clust)
 
         return ctx
 

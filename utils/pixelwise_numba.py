@@ -5,16 +5,20 @@ calls per region, a Python loop over the pixels of ambiguous regions, and every 
 every step (quadratic in the track length). That was ~98% of the detection time.
 
 `PixelwiseTracker` does the same work in numba loops. Cluster histories are kept as an append-only log of
-(track id, event index) and assembled once, at the end of the pass, from the global event arrays. The algorithm is
-unchanged, including its tie-breaking and quirks (slot numbering and reuse, slot 0 never taking part in a split,
-medians that include the overlap events, the ``max(label)`` slot extension), so the outputs are identical to the
-Python loop, which is still used for the other detection modes (and with ``numba_matching=False``).
+(track id, event index) and assembled once, at the end of the pass, into flat arrays (utils/packed_tracks.py).
+The algorithm is unchanged, including its tie-breaking and quirks (slot numbering and reuse, slot 0 never taking
+part in a split, medians that include the overlap events, the ``max(label)`` slot extension), so the outputs are
+identical to the Python loop, which is still used for the other detection modes (and with
+``numba_matching=False``).
 """
 import numpy as np
-from numba import njit
+from numba import njit, prange
 from scipy.ndimage import binary_dilation
 
-_EMPTY = np.array([])
+try:
+    from utils.packed_tracks import PackedTracks
+except ImportError:  # run with only utils/ on the path
+    from packed_tracks import PackedTracks
 
 
 def dilation_offsets(structure):
@@ -518,13 +522,26 @@ def _assemble(log_tid, log_ind, tid):
     return ind, off
 
 
+@njit(cache=True, nogil=True, parallel=True)
+def _take(src, ind, plus):
+    """src[ind] + plus (plus = 1) or src[ind] (plus = 0), in src's dtype, in parallel."""
+    out = np.empty(ind.size, src.dtype)
+    if plus:
+        for i in prange(ind.size):
+            out[i] = src[ind[i]] + 1
+    else:
+        for i in prange(ind.size):
+            out[i] = src[ind[i]]
+    return out
+
+
 # ---------------------------------------------------------------------------------------------------- tracker
 
 class PixelwiseTracker:
     """State of the pixelwise-extension association from step 1 to the end of one pass.
 
-    Built from the step-0 state of utils/detection.py; `export` gives back the same lists and arrays the Python loop
-    would have produced (x_clust, y_clust, t_clust, ind_clust, steps, x_m, y_m, t_m, max_tracks).
+    Built from the step-0 state of utils/detection.py; `export` gives back what the Python loop would have produced
+    (x_clust, y_clust, t_clust, ind_clust as PackedTracks with the same tracks; steps, x_m, y_m, t_m, max_tracks).
     """
 
     def __init__(self, height, width, structure, second_pass, buffer, n_global,
@@ -577,7 +594,6 @@ class PixelwiseTracker:
         self.heap_n = int(h.size)
 
         self.labelmap = np.full((height, width), -1, dtype=np.int32)
-        self.pixmap = np.zeros((height, width), dtype=np.int32)  # scratch of label_events
         self.dilate = bool(second_pass)
         self.offs = dilation_offsets(np.asarray(structure, dtype=bool))
 
@@ -656,31 +672,19 @@ class PixelwiseTracker:
             self.log_ind.append(log_ind[:nlog].copy())
 
     def export(self, X_global, Y_global, T_global):
-        """Per-slot cluster lists and arrays, as the Python loop leaves them at the end of the pass."""
+        """Cluster histories of the pass as PackedTracks (one track per slot, empty for never used slots) and the
+        per-slot arrays, as the Python loop leaves them at the end of the pass."""
         n = self.n
         log_tid = np.concatenate(self.log_tid)
         log_ind = np.concatenate(self.log_ind)
         self.log_tid = self.log_ind = None
         ind, off = _assemble(log_tid, log_ind, self.tid[:n])
         del log_tid, log_ind
-        x_all = X_global[ind] + 1
-        y_all = Y_global[ind] + 1
-        t_all = T_global[ind]
-        x_clust, y_clust, t_clust, ind_clust = [], [], [], []
-        live = self.tid[:n] >= 0
-        for s in range(n):
-            if live[s]:
-                a, b = off[s], off[s + 1]
-                x_clust.append(x_all[a:b])
-                y_clust.append(y_all[a:b])
-                t_clust.append(t_all[a:b])
-                ind_clust.append(ind[a:b])
-            else:  # never used slot (the original holds [] or an empty float array there)
-                x_clust.append(_EMPTY)
-                y_clust.append(_EMPTY)
-                t_clust.append(_EMPTY)
-                ind_clust.append(_EMPTY)
+        start, stop = off[:-1], off[1:]
         dtype = self.steps_dtype_extended if self.extended else self.steps_dtype
-        return dict(x_clust=x_clust, y_clust=y_clust, t_clust=t_clust, ind_clust=ind_clust,
+        return dict(x_clust=PackedTracks(_take(X_global, ind, 1), start, stop),  # X_global[ind] + 1
+                    y_clust=PackedTracks(_take(Y_global, ind, 1), start, stop),
+                    t_clust=PackedTracks(_take(T_global, ind, 0), start, stop),
+                    ind_clust=PackedTracks(ind, start, stop),
                     steps=self.steps[:n].astype(dtype), x_m=self.x_m[:n].copy(), y_m=self.y_m[:n].copy(),
                     t_m=self.t_m[:n].copy(), max_tracks=n)

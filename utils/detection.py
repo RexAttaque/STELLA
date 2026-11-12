@@ -8,6 +8,7 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.ndimage import binary_dilation
 import collections
 from pixelwise_numba import PixelwiseTracker, label_events
+from concurrent.futures import ThreadPoolExecutor
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
@@ -111,43 +112,63 @@ _fast_pixelwise = bool(pixelwise_extension and not pseudo_images and not lightwe
                        and not (max_tracks > 0 and save_mode == False)
                        and globals().get("numba_matching", True))
 _tracker = None
+_next = None  # step k + 1 being prepared while step k is matched
+if _fast_pixelwise:
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _pixmap = np.zeros((height, width), dtype=np.int32)  # scratch of label_events
+
+
+def _prepare_fast_step(k):
+    """Events (X, Y, T, ind_global), 0-based pixels and kept region of every event for step k > 0 of the
+    compiled branch. Runs in a worker thread one step ahead: label_events releases the GIL, so the labelling
+    of step k + 1 overlaps the matching of step k."""
+    X, Y, T, ind_global = _time_window(T_min + (k-overlap) * dt, T_min + (k+1) * dt)
+    T[T<T_min+k*dt] = -1
+    xs = (X - 1).astype(np.int32)
+    ys = (Y - 1).astype(np.int32)
+    if structure.size == 1:  # no dilation: compiled labelling, same labels as scipy below
+        labels_xy, num_regions = label_events(xs, ys, _pixmap, N_pixelwise)
+    else:
+        orig_mask = np.zeros((height, width), dtype=bool)
+        orig_mask[xs, ys] = True
+        labeled, num_regions = label(_dilate(orig_mask))
+        labels_xy = labeled[xs, ys]
+        region_sizes = np.bincount(labels_xy, minlength=num_regions + 1)
+        labels_xy[~(region_sizes >= N_pixelwise)[labels_xy]] = 0
+    return X, Y, T, ind_global, xs, ys, labels_xy, num_regions
+
 
 tic_start_ges = time.time()
 #%% main loop
 for multi in range(multiN):
     _T_sorted = _is_time_sorted(T_global)
     for k in range(N):
-        tic_start = time.time()     
-        if pixelwise_extension:
-            if k>0:
-                X, Y, T, ind_global = _time_window(T_min + (k-overlap) * dt, T_min + (k+1) * dt)
+        tic_start = time.time()
+        _fast_step = _fast_pixelwise and k > 0
+        if not _fast_step:  # (the compiled branch gets its events from _prepare_fast_step)
+            if pixelwise_extension:
+                if k>0:
+                    X, Y, T, ind_global = _time_window(T_min + (k-overlap) * dt, T_min + (k+1) * dt)
+                else:
+                    X, Y, T, ind_global = _time_window(T_min + k * dt, T_min + (k+1) * dt)
             else:
                 X, Y, T, ind_global = _time_window(T_min + k * dt, T_min + (k+1) * dt)
-        else:
-            X, Y, T, ind_global = _time_window(T_min + k * dt, T_min + (k+1) * dt)
-        if pixelwise_extension:
-            T[T<T_min+k*dt] = -1
-        if pseudo_images:
-            X_flat = X.ravel()
-            Y_flat = Y.ravel()
-            T_flat = T.ravel()
-        
-        if _fast_pixelwise and k > 0:
+            if pixelwise_extension:
+                T[T<T_min+k*dt] = -1
+            if pseudo_images:
+                X_flat = X.ravel()
+                Y_flat = Y.ravel()
+                T_flat = T.ravel()
+
+        if _fast_step:
+            if _next is None:
+                _next = _pool.submit(_prepare_fast_step, k)
+            X, Y, T, ind_global, xs, ys, labels_xy, num_regions = _next.result()
+            _next = _pool.submit(_prepare_fast_step, k + 1) if k + 1 < N else None
             if _tracker is None:  # takes over the clusters started at step 0
                 _tracker = PixelwiseTracker(height, width, structure, multi == 1, buffer, len(X_global),
                                             steps, inactive, inactive_k, valid, x_m, y_m, t_m,
                                             active_pixels, ind_clust)
-            xs = (X - 1).astype(np.int32)
-            ys = (Y - 1).astype(np.int32)
-            if structure.size == 1:  # no dilation: compiled labelling, same labels as scipy below
-                labels_xy, num_regions = label_events(xs, ys, _tracker.pixmap, N_pixelwise)
-            else:
-                orig_mask = np.zeros((height, width), dtype=bool)
-                orig_mask[xs, ys] = True
-                labeled, num_regions = label(_dilate(orig_mask))
-                labels_xy = labeled[xs, ys]
-                region_sizes = np.bincount(labels_xy, minlength=num_regions + 1)
-                labels_xy[~(region_sizes >= N_pixelwise)[labels_xy]] = 0
             _tracker.step(k, xs, ys, labels_xy, num_regions, X, Y, T, ind_global)
         elif k == 0:
             if pseudo_images:
@@ -737,11 +758,19 @@ for multi in range(multiN):
         if stop_event is not None and stop_event.is_set():
             break
 
-    if _tracker is not None:  # cluster lists and arrays of the pass, as the Python branch leaves them
-        _out = _tracker.export(X_global, Y_global, T_global)
-        x_clust, y_clust, t_clust, ind_clust = _out["x_clust"], _out["y_clust"], _out["t_clust"], _out["ind_clust"]
-        steps, x_m, y_m, t_m, max_tracks = _out["steps"], _out["x_m"], _out["y_m"], _out["t_m"], _out["max_tracks"]
-        _tracker = _out = None
+    if _next is not None:  # a step prepared before a stop request
+        _next.result()
+        _next = None
+    if _fast_pixelwise:
+        # the compiled branch keeps the clusters as PackedTracks (utils/packed_tracks.py): one flat array per
+        # quantity instead of lists of millions of small arrays; same values, track by track
+        if _tracker is not None:
+            _out = _tracker.export(X_global, Y_global, T_global)
+            x_clust, y_clust, t_clust, ind_clust = _out["x_clust"], _out["y_clust"], _out["t_clust"], _out["ind_clust"]
+            steps, x_m, y_m, t_m, max_tracks = _out["steps"], _out["x_m"], _out["y_m"], _out["t_m"], _out["max_tracks"]
+            _tracker = _out = None
+        else:  # no step after k = 0
+            x_clust, y_clust, t_clust, ind_clust = (PackedTracks.from_list(c) for c in (x_clust, y_clust, t_clust, ind_clust))
 
     if lightweight_mode==False:
         # for i in range(3):
@@ -752,7 +781,7 @@ for multi in range(multiN):
 
 
     if multi==1:
-        n_events = [len(a) for a in ind_clust]
+        n_events = [] if isinstance(ind_clust, PackedTracks) else [len(a) for a in ind_clust]
         if lightweight_mode or pseudo_images:
             for i in range(len(ind_clust)):
                 if n_events[i]<20:
@@ -763,6 +792,9 @@ for multi in range(multiN):
                     x_m[i] = np.array([])
                     y_m[i] = np.array([])
                     t_m[i] = np.array([])
+        elif isinstance(ind_clust, PackedTracks):
+            _keep = ind_clust.lengths() >= 20
+            x_clust, y_clust, t_clust, ind_clust = (c.keep(_keep) for c in (x_clust, y_clust, t_clust, ind_clust))
         else:
             for i in range(len(ind_clust)):
                 if n_events[i]<20:
@@ -770,22 +802,30 @@ for multi in range(multiN):
                     y_clust[i] = np.array([], dtype=int)
                     t_clust[i] = np.array([], dtype=int)
                     ind_clust[i] = np.array([], dtype=int)
-    
+
     if multi==0:
         if lightweight_mode == False:
-            n_events = [len(a) for a in x_clust]
-            if not test_mode:
-                for i in range(len(ind_clust)):
-                    if steps[i] < 3 or n_events[i]<20:
-                        x_clust[i] = np.array([], dtype=int)
-                        y_clust[i] = np.array([], dtype=int)
-                        t_clust[i] = np.array([], dtype=int)
-                        ind_clust[i] = np.array([], dtype=int)
+            if isinstance(x_clust, PackedTracks):
+                if not test_mode:
+                    _keep = ~((steps[:len(x_clust)] < 3) | (x_clust.lengths() < 20))
+                    x_clust, y_clust, t_clust, ind_clust = (c.keep(_keep) for c in (x_clust, y_clust, t_clust, ind_clust))
+            else:
+                n_events = [len(a) for a in x_clust]
+                if not test_mode:
+                    for i in range(len(ind_clust)):
+                        if steps[i] < 3 or n_events[i]<20:
+                            x_clust[i] = np.array([], dtype=int)
+                            y_clust[i] = np.array([], dtype=int)
+                            t_clust[i] = np.array([], dtype=int)
+                            ind_clust[i] = np.array([], dtype=int)
             if multi < multiN - 1:  # the next pass gets the events left (X_global is not used after the last)
-                ind_all = np.concatenate(ind_clust)
-                ind_all = ind_all.astype(int)
                 mask = np.ones(len(X_global), dtype=bool)
-                mask[ind_all] = False
+                if isinstance(ind_clust, PackedTracks):
+                    ind_clust.clear_in_mask(mask)
+                else:
+                    ind_all = np.concatenate(ind_clust)
+                    ind_all = ind_all.astype(int)
+                    mask[ind_all] = False
                 X_global = X_global[mask]
                 Y_global = Y_global[mask]
                 T_global = T_global[mask]
@@ -874,18 +914,38 @@ for multi in range(multiN):
             y_m = [np.array([]) for _ in range(max_tracks)]
             t_m = [np.array([]) for _ in range(max_tracks)]
 
-x_clust = [np.asarray(a) for a in x_clust]
-y_clust = [np.asarray(a) for a in y_clust]
-t_clust = [np.asarray(a) for a in t_clust]
-ind_clust = [np.asarray(a) for a in ind_clust]
+if _fast_pixelwise:
+    _pool.shutdown()
+else:
+    x_clust = [np.asarray(a) for a in x_clust]
+    y_clust = [np.asarray(a) for a in y_clust]
+    t_clust = [np.asarray(a) for a in t_clust]
+    ind_clust = [np.asarray(a) for a in ind_clust]
 
-if "x_clust_fast" in locals():
-    x_clust_fast = [np.asarray(a) for a in x_clust_fast]
-    y_clust_fast = [np.asarray(a) for a in y_clust_fast]
-    t_clust_fast = [np.asarray(a) for a in t_clust_fast]
-    ind_clust_fast = [np.asarray(a) for a in ind_clust_fast]
+    if "x_clust_fast" in locals():
+        x_clust_fast = [np.asarray(a) for a in x_clust_fast]
+        y_clust_fast = [np.asarray(a) for a in y_clust_fast]
+        t_clust_fast = [np.asarray(a) for a in t_clust_fast]
+        ind_clust_fast = [np.asarray(a) for a in ind_clust_fast]
 
-if lightweight_mode == False:         
+
+def _nonempty_packed(c):
+    """The non-empty tracks of c (PackedTracks, or the lists reset after a pass) as PackedTracks."""
+    if isinstance(c, PackedTracks):
+        return c.nonempty()
+    if not any(map(len, c)):  # (the reset lists: millions of empty slots)
+        return PackedTracks.from_list([])
+    return PackedTracks.from_list([a for a in c if len(a) > 0])
+
+
+if _fast_pixelwise:
+    # same as the list version below: non-empty tracks of the last pass, then those of the first pass
+    x_clust, y_clust, t_clust, ind_clust = (
+        PackedTracks.concat([_nonempty_packed(a), _nonempty_packed(b)])
+        for a, b in ((x_clust, x_clust_fast), (y_clust, y_clust_fast),
+                     (t_clust, t_clust_fast), (ind_clust, ind_clust_fast)))
+    x_clust_fast = y_clust_fast = t_clust_fast = ind_clust_fast = None  # frees the flat arrays of the pass
+elif lightweight_mode == False:
     x_clust = [arr for arr in x_clust if arr.size > 0] + \
              [arr for arr in x_clust_fast if arr.size > 0]
     y_clust = [arr for arr in y_clust if arr.size > 0] + \
@@ -922,7 +982,9 @@ else:
         x_clust, y_clust, t_clust, steps, ind_clust, x_m, y_m, t_m = repair_tracks_pseudoframes(x_clust, y_clust, t_clust, ind_clust, steps, dt,x_m,y_m,t_m)
 
 if not test_mode:
-    if lightweight_mode == False:
+    if isinstance(x_clust, PackedTracks):
+        x_clust, y_clust, t_clust = x_clust.nonempty(), y_clust.nonempty(), t_clust.nonempty()
+    elif lightweight_mode == False:
         x_clust = [arr for arr in x_clust if arr.size > 0]
         y_clust = [arr for arr in y_clust if arr.size > 0]
         t_clust = [arr for arr in t_clust if arr.size > 0]

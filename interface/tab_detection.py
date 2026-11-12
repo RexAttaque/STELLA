@@ -12,6 +12,7 @@ import math
 import matplotlib.pyplot as plt
 from utils.plots import figure_to_rgba_flat
 from utils.raster import binary_rgba, draw_dots, scalar_rgba
+from utils.packed_tracks import PackedTracks
 from matplotlib.colors import ListedColormap
 from datetime import datetime
 import sys, io, contextlib, threading, queue
@@ -1102,22 +1103,28 @@ class DetectionTab:
         valid_idx = self._valid_cluster_indices(out.x_clust)
         n_clusters = len(valid_idx)
 
-        events_per_cluster = []
-        all_inds = []
-        
-        for i in valid_idx:
-            a = np.asarray(out.ind_clust[i]).ravel()
-            if a.size == 0:
-                events_per_cluster.append(0)
-                continue
-            a = a.astype(int, copy=False)
-            au = np.unique(a)
-            events_per_cluster.append(int(au.size))
-            all_inds.append(au)
-        
-        avg_events = float(np.mean(events_per_cluster)) if events_per_cluster else 0.0
-        
-        unique_clustered_events = int(np.unique(np.concatenate(all_inds)).size) if all_inds else 0
+        if isinstance(out.ind_clust, PackedTracks):  # same numbers, computed on the flat array
+            sel = out.ind_clust[np.asarray(valid_idx, dtype=np.int64)]
+            events_per_cluster = sel.distinct_per_track()
+            avg_events = float(np.mean(events_per_cluster)) if events_per_cluster.size else 0.0
+            unique_clustered_events = sel.distinct_total()
+        else:
+            events_per_cluster = []
+            all_inds = []
+
+            for i in valid_idx:
+                a = np.asarray(out.ind_clust[i]).ravel()
+                if a.size == 0:
+                    events_per_cluster.append(0)
+                    continue
+                a = a.astype(int, copy=False)
+                au = np.unique(a)
+                events_per_cluster.append(int(au.size))
+                all_inds.append(au)
+
+            avg_events = float(np.mean(events_per_cluster)) if events_per_cluster else 0.0
+
+            unique_clustered_events = int(np.unique(np.concatenate(all_inds)).size) if all_inds else 0
         sum_clustered_events = unique_clustered_events
 
         pt = self.preprocessing_tab
@@ -1170,6 +1177,8 @@ class DetectionTab:
     
     def _valid_cluster_indices(self, x_clust) -> list[int]:
         """Cluster gelten als valid, wenn x_clust mindestens einen Nicht-NaN enthält."""
+        if isinstance(x_clust, PackedTracks):
+            return np.flatnonzero(x_clust.count_finite() > 0).tolist()
         valid = []
         for i, arr in enumerate(x_clust):
             if self._count_non_nan(arr) > 0:
@@ -1190,18 +1199,21 @@ class DetectionTab:
         cache = getattr(self, "_cluster_trange_cache", None)
         if cache is None or cache[0] is not t_clust or cache[1] != len(t_clust):
             n = len(t_clust)
-            tmin = np.full(n, np.inf)
-            tmax = np.full(n, -np.inf)
-            for i, tc in enumerate(t_clust):
-                if tc is None:
-                    continue
-                t = np.asarray(tc, dtype=float).ravel()
-                if t.size == 0:
-                    continue
-                t = t[np.isfinite(t)]
-                if t.size:
-                    tmin[i] = t.min()
-                    tmax[i] = t.max()
+            if isinstance(t_clust, PackedTracks):  # one compiled pass over the flat array
+                tmin, tmax = t_clust.finite_min_max()
+            else:
+                tmin = np.full(n, np.inf)
+                tmax = np.full(n, -np.inf)
+                for i, tc in enumerate(t_clust):
+                    if tc is None:
+                        continue
+                    t = np.asarray(tc, dtype=float).ravel()
+                    if t.size == 0:
+                        continue
+                    t = t[np.isfinite(t)]
+                    if t.size:
+                        tmin[i] = t.min()
+                        tmax[i] = t.max()
             cache = (t_clust, n, tmin, tmax)
             self._cluster_trange_cache = cache
         _, _, tmin, tmax = cache
@@ -1666,8 +1678,11 @@ class DetectionTab:
             method = self.params.get("detection_method", "pixelwise extension")
 
             t_src = getattr(out, "t_clust", None)
-    
-            if t_src is not None:
+
+            if isinstance(t_src, PackedTracks):  # durations of the tracks with at least 2 time stamps
+                t_lo, t_hi = t_src.finite_min_max()
+                durations_us = (t_hi - t_lo)[t_src.count_finite() >= 2].tolist()
+            elif t_src is not None:
                 if isinstance(t_src, (list, tuple)):
                     clusters = t_src
                 else:
