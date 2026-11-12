@@ -6,6 +6,7 @@ from scipy.ndimage import convolve
 from skimage.measure import label, regionprops
 from scipy.optimize import linear_sum_assignment
 from skimage.filters import threshold_otsu
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from joblib.parallel import BatchCompletionCallBack
 from joblib import Parallel
@@ -388,23 +389,25 @@ def _track_ends(x, y, t, lo, hi, ids, dt, t_s, t_e, x_s, y_s, x_e, y_e):
         y_e[i] = _nanmedian_where(y[a:b], tc, t_e[i], False, buf)
 
 
-@njit(cache=True, nogil=True)
-def _link_tracks(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e, rank, dt, max_dtt, r, n):
-    """Links of repair_tracks: for every start (ascending), the first end within r (in cKDTree order = ascending
-    rank) that is not the track itself, not used yet and 0 < |(t_s - dt) - (t_e + dt)| <= max_dtt.
+@njit(cache=True, nogil=True, parallel=True)
+def _link_candidates(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e, dt, max_dtt, r):
+    """Possible links of repair_tracks: for every start, the ends within r that are not the track itself and have
+    0 < |(t_s - dt) - (t_e + dt)| <= max_dtt.
 
-    Ends are found through a (time, x, y) grid instead of the ball query: an end can only link if
-    t_e is in [t_s - 3 dt, t_s - dt], so only a few grid rows are searched.
+    Returns (off, cand, d2): the candidates of targets[q] are the end tracks cand[off[q]:off[q + 1]], d2 their squared
+    distances. Ends are found through a (time, x, y) grid instead of a ball query: an end can only link if t_e is in
+    [t_s - 3 dt, t_s - dt], so only a few grid rows are searched. Targets are independent: searched in parallel
+    (counted, then written).
     """
     ne = ends.size
-    lt = np.empty(targets.size, np.int64)
-    ls = np.empty(targets.size, np.int64)
-    if ne == 0 or targets.size == 0:
-        return lt[:0], ls[:0]
+    nt = targets.size
+    off = np.zeros(nt + 1, np.int64)
+    if ne == 0 or nt == 0:
+        return off, np.empty(0, np.int64), np.empty(0)
     tb = np.empty(ne, np.int64)
     cx = np.empty(ne, np.int64)
     cy = np.empty(ne, np.int64)
-    for j in range(ne):
+    for j in prange(ne):
         e = ends[j]
         tb[j] = np.int64(np.floor(t_e[e] / dt))
         cx[j] = np.int64(np.floor(x_e[e] / r))
@@ -416,50 +419,75 @@ def _link_tracks(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e, rank, dt, max_dtt,
     ncx = cx.max() - cx0 + 1
     ncy = cy.max() - cy0 + 1
     key = np.empty(ne, np.int64)
-    for j in range(ne):
+    for j in prange(ne):
         key[j] = ((tb[j] - tb0) * ncx + (cx[j] - cx0)) * ncy + (cy[j] - cy0)
     order = np.argsort(key)
     skey = key[order]
-    used = np.zeros(n, np.bool_)
+    ssrc = ends[order]
     r2 = r * r
+    cnt = np.zeros(nt, np.int64)
+    cand = np.empty(0, np.int64)
+    d2 = np.empty(0)
+    for write in range(2):
+        if write:
+            for q in range(nt):
+                off[q + 1] = off[q] + cnt[q]
+            cand = np.empty(off[nt], np.int64)
+            d2 = np.empty(off[nt])
+        for q in prange(nt):
+            tgt = targets[q]
+            xs = x_s[tgt]
+            ys = y_s[tgt]
+            # generous bounds (one row / cell more on each side): the exact tests below decide
+            b_lo = max(np.int64(np.floor((t_s[tgt] - 3 * dt) / dt)) - 1, tb0)
+            b_hi = min(np.int64(np.floor((t_s[tgt] - dt) / dt)) + 1, tb1)
+            qx = np.int64(np.floor(xs / r))
+            qy = np.int64(np.floor(ys / r))
+            y_lo = max(qy - 1, cy0) - cy0
+            y_hi = min(qy + 1, cy0 + ncy - 1) - cy0
+            c = off[q]
+            if y_lo <= y_hi:
+                for b in range(b_lo, b_hi + 1):
+                    for gx in range(max(qx - 1, cx0), min(qx + 1, cx0 + ncx - 1) + 1):
+                        row = ((b - tb0) * ncx + (gx - cx0)) * ncy
+                        p = np.searchsorted(skey, row + y_lo)
+                        while p < ne and skey[p] <= row + y_hi:
+                            src = ssrc[p]
+                            p += 1
+                            if src == tgt:
+                                continue
+                            dx = xs - x_e[src]
+                            dy = ys - y_e[src]
+                            dd = dx * dx + dy * dy
+                            if dd > r2:
+                                continue
+                            time_diff = abs((t_s[tgt] - dt) - (t_e[src] + dt))
+                            if not (0 < time_diff <= max_dtt):
+                                continue
+                            if write:
+                                cand[c] = src
+                                d2[c] = dd
+                            c += 1
+            if not write:
+                cnt[q] = c
+    return off, cand, d2
+
+
+@njit(cache=True, nogil=True)
+def _pick_links(targets, off, cand, rank, n):
+    """For every start (ascending), its candidate of lowest rank whose end is not used yet; each end links once."""
+    lt = np.empty(targets.size, np.int64)
+    ls = np.empty(targets.size, np.int64)
+    used = np.zeros(n, np.bool_)
     nl = 0
     for q in range(targets.size):
-        tgt = targets[q]
-        xs = x_s[tgt]
-        ys = y_s[tgt]
-        # generous bounds (one row / cell more on each side): the exact tests below decide
-        b_lo = max(np.int64(np.floor((t_s[tgt] - 3 * dt) / dt)) - 1, tb0)
-        b_hi = min(np.int64(np.floor((t_s[tgt] - dt) / dt)) + 1, tb1)
-        qx = np.int64(np.floor(xs / r))
-        qy = np.int64(np.floor(ys / r))
-        y_lo = max(qy - 1, cy0) - cy0
-        y_hi = min(qy + 1, cy0 + ncy - 1) - cy0
         best = -1
-        best_rank = np.iinfo(np.int64).max
-        if y_lo <= y_hi:
-            for b in range(b_lo, b_hi + 1):
-                for gx in range(max(qx - 1, cx0), min(qx + 1, cx0 + ncx - 1) + 1):
-                    row = ((b - tb0) * ncx + (gx - cx0)) * ncy
-                    p = np.searchsorted(skey, row + y_lo)
-                    while p < ne and skey[p] <= row + y_hi:
-                        j = order[p]
-                        p += 1
-                        if rank[j] >= best_rank:
-                            continue
-                        src = ends[j]
-                        if src == tgt or used[src]:
-                            continue
-                        dx = xs - x_e[src]
-                        dy = ys - y_e[src]
-                        if dx * dx + dy * dy > r2:
-                            continue
-                        time_diff = abs((t_s[tgt] - dt) - (t_e[src] + dt))
-                        if not (0 < time_diff <= max_dtt):
-                            continue
-                        best = src
-                        best_rank = rank[j]
+        for c in range(off[q], off[q + 1]):
+            src = cand[c]
+            if not used[src] and (best < 0 or rank[src] < rank[best]):
+                best = src
         if best >= 0:
-            lt[nl] = tgt
+            lt[nl] = targets[q]
             ls[nl] = best
             nl += 1
             used[best] = True
@@ -467,7 +495,11 @@ def _link_tracks(targets, x_s, y_s, t_s, ends, x_e, y_e, t_e, rank, dt, max_dtt,
 
 
 def _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt):
-    """(targets, sources) of repair_tracks, in the order the links are applied."""
+    """(targets, sources) of repair_tracks, in the order the links are applied.
+
+    As the original ball query: every start takes the first acceptable end in cKDTree order (the order of
+    tree.indices). The tree is only built for that order, in a thread while the candidates are searched.
+    """
     max_dtt  = dt
     max_dist = 5
 
@@ -478,11 +510,14 @@ def _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt):
     targets = np.flatnonzero(~np.isnan(x_s) & ~np.isnan(y_s))
     if targets.size == 0 or end_indices.size == 0 or not dt > 0:
         return np.zeros(0, np.int64), np.zeros(0, np.int64)
-    tree = cKDTree(end_points)  # built as before: its point order decides between candidates
-    rank = np.empty(end_indices.size, np.int64)
-    rank[tree.indices] = np.arange(end_indices.size)
-    return _link_tracks(targets, x_s, y_s, t_s, end_indices, x_e, y_e, t_e, rank,
-                        float(dt), float(max_dtt), float(max_dist), n)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        tree = pool.submit(cKDTree, end_points)  # the build releases the GIL
+        off, cand, _ = _link_candidates(targets, x_s, y_s, t_s, end_indices, x_e, y_e, t_e,
+                                        float(dt), float(max_dtt), float(max_dist))
+        tree = tree.result()
+    rank = np.empty(n, np.int64)  # by track index
+    rank[end_indices[tree.indices]] = np.arange(end_indices.size)
+    return _pick_links(targets, off, cand, rank, n)
 
 
 @njit(cache=True, nogil=True)
@@ -568,7 +603,7 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
 
     Same links and results as the original per-cluster numpy version: the start / end medians are compiled
     (clusters taken in chunks), and the first acceptable neighbour of the ball query is found through a time / space
-    grid, in the order cKDTree would list it (its traversal returns points in the order of tree.indices).
+    grid (_find_links), in the order cKDTree would list it (its traversal returns points in the order of tree.indices).
     """
     if isinstance(x_clust, PackedTracks):
         return repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt)
