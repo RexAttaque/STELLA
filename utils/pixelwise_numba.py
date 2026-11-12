@@ -12,6 +12,11 @@ identical to the Python loop, which is still used for the other detection modes 
 ``numba_matching=False``).
 """
 import numpy as np
+try:  # thread count of the parallel kernels (utils/parallel.py)
+    from utils import parallel as _parallel  # noqa: F401
+except ImportError:  # run with only utils/ on the path
+    import parallel as _parallel  # noqa: F401
+import numba
 from numba import njit, prange
 from scipy.ndimage import binary_dilation
 
@@ -32,6 +37,8 @@ def dilation_offsets(structure):
     return (np.argwhere(binary_dilation(m, structure=structure, iterations=1)) - (sx, sy)).astype(np.int64)
 
 
+SERIAL_EVENTS = 20_000  # steps with fewer events run their kernels on one thread
+
 # ---------------------------------------------------------------------------------------------------- kernels
 
 @njit(cache=True, nogil=True)
@@ -45,22 +52,30 @@ def _find(parent, j):
 
 
 @njit(cache=True, nogil=True)
-def label_events(xs, ys, pixmap, n_min):
-    """Region of every event, as detection.py computes it without dilation (1x1 structure):
+def label_events(xs, ys, pixmap, n_min, offs):
+    """Region of every event, as detection.py computes it with scipy:
 
-        mask[xs, ys] = True; labeled, num = scipy.ndimage.label(mask); labels = labeled[xs, ys]
+        mask[xs, ys] = True; mask = binary_dilation(mask, structure)   # (no dilation for a 1x1 structure)
+        labeled, num = scipy.ndimage.label(mask); labels = labeled[xs, ys]
         labels[np.bincount(labels)[labels] < n_min] = 0
 
-    Two-pass labelling like scipy's: provisional labels in raster order, merged with the smallest label as root,
-    so the roots taken in increasing order number the regions in raster order of their first pixel, as scipy
-    does. 4-connectivity (scipy's default structure). `pixmap` is an all-zero int32 (H, W) scratch array, left
-    all zero. Returns (labels int32, num).
+    `offs` are the pixels the dilation sets around one pixel (dilation_offsets; [[0, 0]] for 1x1). Two-pass
+    labelling like scipy's: provisional labels in raster order, merged with the smallest label as root, so the
+    roots taken in increasing order number the regions in raster order of their first pixel, as scipy does.
+    4-connectivity (scipy's default structure). (A raster scan of the whole map is faster than visiting only the
+    event pixels: sequential memory access.) `pixmap` is an all-zero int32 (H, W) scratch array, left all zero.
+    Returns (labels int32, num).
     """
     H, W = pixmap.shape
     n = xs.size
+    m = offs.shape[0]
     for i in range(n):
-        pixmap[xs[i], ys[i]] = -1
-    parent = np.empty(n + 1, np.int64)  # at most one provisional label per distinct pixel
+        for o in range(m):
+            x = xs[i] + offs[o, 0]
+            y = ys[i] + offs[o, 1]
+            if 0 <= x < H and 0 <= y < W:
+                pixmap[x, y] = -1
+    parent = np.empty(n * m + 1, np.int64)  # at most one provisional label per set pixel
     parent[0] = 0
     nprov = 0
     for x in range(H):
@@ -95,11 +110,14 @@ def label_events(xs, ys, pixmap, n_min):
     labels = np.empty(n, np.int32)
     size = np.zeros(num + 1, np.int64)
     for i in range(n):
-        l = final[pixmap[xs[i], ys[i]]]
+        l = final[pixmap[xs[i], ys[i]]]  # (0 if the dilation does not cover the event's own pixel)
         labels[i] = l
         size[l] += 1
-    for i in range(n):
-        pixmap[xs[i], ys[i]] = 0
+    if m == 1:
+        for i in range(n):
+            pixmap[xs[i], ys[i]] = 0
+    else:
+        pixmap[:] = 0
     for i in range(n):
         if size[labels[i]] < n_min:
             labels[i] = 0
@@ -218,258 +236,349 @@ def _heap_pop(heap, n):
 
 
 @njit(cache=True, nogil=True)
-def _update(s, sel, ns, k, xs, ys, Xw, Yw, Tw, indw, labelmap, ap_off, ap_len, ap_x, ap_y,
-            steps, inactive_k, x_m, y_m, t_m, tid, mark, fx, fy, ft,
-            nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, log_tid, log_ind, nlog):
-    """utils_v2.update_cluster + the t >= 0 filter + _clear_label + active_temp, for events sel[:ns] of cluster s."""
-    for q in range(ns):
-        i = sel[q]
-        fx[q] = Xw[i]
-        fy[q] = Yw[i]
-        ft[q] = Tw[i]
-    # the medians include the overlap events (T = -1), as before
-    x_m[s] = _median(fx, ns)
-    y_m[s] = _median(fy, ns)
-    t_m[s] = _median(ft, ns) * 1e-6
-    ent_slot[nent] = s
-    ent_off[nent] = nap
-    for q in range(ns):
-        i = sel[q]
-        if Tw[i] >= 0:
-            log_tid[nlog] = tid[s]
-            log_ind[nlog] = indw[i]
-            nlog += 1
-        nap_x[nap] = xs[i]
-        nap_y[nap] = ys[i]
-        nap += 1
-    ent_len[nent] = ns
-    nent += 1
-    steps[s] += 1
-    inactive_k[s] = k
-    mark[s] = 1
-    # the cluster leaves the label map: later regions of this step cannot match it again
-    for p in range(ap_off[s], ap_off[s] + ap_len[s]):
-        if labelmap[ap_x[p], ap_y[p]] == s:
-            labelmap[ap_x[p], ap_y[p]] = -1
-    return nap, nent, nlog
+def _touched(a, b, dilate, offs, order, xs, ys, labelmap, out):
+    """Clusters under region events order[a:b] (under its dilation within its bounding box + 1 when `dilate`),
+    as written in the label map, into out (ascending); returns their number."""
+    H, W = labelmap.shape
+    nt = 0
+    last = -1
+    if dilate:
+        x0 = xs[order[a]]
+        x1 = x0
+        y0 = ys[order[a]]
+        y1 = y0
+        for e in range(a, b):
+            i = order[e]
+            x0 = min(x0, xs[i])
+            x1 = max(x1, xs[i])
+            y0 = min(y0, ys[i])
+            y1 = max(y1, ys[i])
+        rx0 = max(x0 - 1, 0)
+        rx1 = min(x1 + 2, H)
+        ry0 = max(y0 - 1, 0)
+        ry1 = min(y1 + 2, W)
+        for e in range(a, b):
+            i = order[e]
+            for o in range(offs.shape[0]):
+                px = xs[i] + offs[o, 0]
+                py = ys[i] + offs[o, 1]
+                if px < rx0 or px >= rx1 or py < ry0 or py >= ry1:
+                    continue
+                l = labelmap[px, py]
+                if l < 0 or l == last:
+                    continue
+                last = l
+                new = True
+                for q in range(nt):
+                    if out[q] == l:
+                        new = False
+                        break
+                if new:
+                    out[nt] = l
+                    nt += 1
+    else:
+        for e in range(a, b):
+            i = order[e]
+            l = labelmap[xs[i], ys[i]]
+            if l < 0 or l == last:
+                continue
+            last = l
+            new = True
+            for q in range(nt):
+                if out[q] == l:
+                    new = False
+                    break
+            if new:
+                out[nt] = l
+                nt += 1
+    for q in range(1, nt):  # insertion sort: a handful of clusters
+        v = out[q]
+        r = q - 1
+        while r >= 0 and out[r] > v:
+            out[r + 1] = out[r]
+            r -= 1
+        out[r + 1] = v
+    return nt
 
 
 @njit(cache=True, nogil=True)
+def _split(cl, nt, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y, cx, cy, cnt, clg, asg, two):
+    """Split of a region touching the clusters cl[:nt] (ascending) between their centres (mean of their active
+    pixels): asg[e] = index in cl of the cluster event order[e] goes to, cnt[c] = its number of events, clg[c] the
+    number of them with T >= 0 (its history entries).
+
+    Centres closer than 4 px to another centre are moved out of reach (pdist / squareform, d < 4). `two` is 2.0
+    passed at run time: the original squares distances with np.float64 ** 2 (the C pow), which is not always the
+    correctly rounded x * x; a run-time exponent keeps that call.
+    """
+    for c in range(nt):
+        s = cl[c]
+        sx = 0.0
+        sy = 0.0
+        for p in range(ap_off[s], ap_off[s] + ap_len[s]):
+            sx += ap_x[p]
+            sy += ap_y[p]
+        cx[c] = sx / ap_len[s]
+        cy[c] = sy / ap_len[s]
+    for c in range(nt):
+        cnt[c] = 0  # "too close" flags first, then the event counts
+    for c in range(nt):
+        for d in range(c + 1, nt):
+            dx = cx[c] - cx[d]
+            dy = cy[c] - cy[d]
+            if np.sqrt(dx * dx + dy * dy) < 4:
+                cnt[c] = 1
+                cnt[d] = 1
+    for c in range(nt):
+        if cnt[c]:
+            cx[c] = -1000.0
+            cy[c] = -1000.0
+        cnt[c] = 0
+        clg[c] = 0
+    for e in range(a, b):
+        i = order[e]
+        best = 0
+        bd = 0.0
+        for c in range(nt):
+            dd = (xs[i] - cx[c]) ** two + (ys[i] - cy[c]) ** two
+            if c == 0 or dd < bd:  # np.argmin: first minimum
+                bd = dd
+                best = c
+        asg[e] = best
+        cnt[best] += 1
+        if Tw[i] >= 0:
+            clg[best] += 1
+
+
+@njit(cache=True, nogil=True, parallel=True)
 def _match(k, dilate, offs, xs, ys, Xw, Yw, Tw, indw, order, off, labelmap, vlist,
-           ap_off, ap_len, ap_x, ap_y, steps, inactive_k, x_m, y_m, t_m, tid, mark, touch,
-           nap_x, nap_y, ent_slot, ent_off, ent_len, log_tid, log_ind, newlabs, two):
+           ap_off, ap_len, ap_x, ap_y, steps, inactive_k, x_m, y_m, t_m, mark,
+           nap_x, nap_y, ent_slot, ent_off, ent_len, ent_lg, log_ind, newlabs, reg_lg, two):
     """Match the regions of one step to the valid clusters (the region loop of the pixelwise branch).
 
+    The original takes the regions in ascending label order; a cluster that matches a region leaves the label map,
+    so later regions cannot match it. That is the only dependence between regions, so the work is split into
+    passes, each one parallel over regions except the short resolution pass:
+
+    1. the label map of the active clusters (sequential: shared pixels keep the highest cluster);
+    2. the clusters under every region, in the label map as painted (parallel);
+    3. the split of every region touching several clusters, as if all of them were still free (parallel);
+    4. resolution in ascending label order (sequential): the clusters already taken leave the region; a region
+       left with one cluster gives it all its events, with several the split is used (computed again only if some
+       of its clusters were taken); every cluster that takes events is one "job";
+    5. the jobs (event copies, medians, active pixels, history log) in parallel, each one writing at offsets
+       computed from the job sizes in resolution order, so every output is where the sequential loop put it.
+
+    Every job is one entry: its cluster (ent_slot), its new active pixels (ent_off, ent_len into nap_x, nap_y)
+    and its history entries (ent_lg consecutive event indices in log_ind, in entry order).
     Returns (new active-pixel entries, log entries, unmatched regions to start as new clusters).
-    `two` is 2.0 passed at run time: the original squares distances with np.float64 ** 2 (the C pow), which is
-    not always the correctly rounded x * x; a run-time exponent keeps that call.
+    `mark` (all zero on entry and on return) flags the clusters that took events. reg_lg[lab]: events of region
+    lab with T >= 0, for _create.
     """
-    H, W = labelmap.shape
     nv = vlist.size
-    # label map of the active clusters, written in ascending order: shared pixels keep the highest cluster
+    n_lab = off.size - 2
+    n_ev = xs.size
+    n_off = offs.shape[0] if dilate else 1
     for j in range(nv):
         s = vlist[j]
         for p in range(ap_off[s], ap_off[s] + ap_len[s]):
             labelmap[ap_x[p], ap_y[p]] = s
 
-    n_lab = off.size - 2
-    nmax = 1
+    # 2. + 3. (one parallel loop: every loop start costs ~50 us) clusters under every region (at most
+    # min(probes, nv) per region), speculative splits (all touched clusters free), events with T >= 0 (history
+    # entries, kept for _create in reg_lg) and with T > 0 (new clusters) of every region
+    tbase = np.zeros(n_lab + 2, np.int64)
     for lab in range(1, n_lab + 1):
-        nmax = max(nmax, off[lab + 1] - off[lab])
-    fx = np.empty(nmax)
-    fy = np.empty(nmax)
-    ft = np.empty(nmax)
-    sel = np.empty(nmax, np.int64)
-    asg = np.empty(nmax, np.int64)
-    tl = np.empty(max(nv, 1), np.int64)
-    cx = np.empty(max(nv, 1))
-    cy = np.empty(max(nv, 1))
-    far = np.zeros(max(nv, 1), np.bool_)
-    cnt = np.zeros(max(nv, 1), np.int64)
-    assigned = np.zeros(n_lab + 1, np.uint8)
-    nap = 0
-    nent = 0
-    nlog = 0
-
-    for lab in range(1, n_lab + 1):
+        tbase[lab + 1] = tbase[lab] + min((off[lab + 1] - off[lab]) * n_off, max(nv, 1))
+    tl = np.empty(tbase[n_lab + 1], np.int64)
+    tn = np.zeros(n_lab + 1, np.int64)
+    cx = np.empty(tl.size)
+    cy = np.empty(tl.size)
+    cnt = np.zeros(tl.size, np.int64)
+    clg = np.zeros(tl.size, np.int64)
+    asg = np.empty(n_ev, np.int64)
+    reg_new = np.zeros(n_lab + 1, np.int64)
+    for lab in prange(1, n_lab + 1):
         a = off[lab]
         b = off[lab + 1]
+        lg = 0
+        nw = 0
+        for e in range(a, b):
+            t = Tw[order[e]]
+            if t >= 0:
+                lg += 1
+                if t > 0:
+                    nw += 1
+        reg_lg[lab] = lg
+        reg_new[lab] = nw
         if a == b:
             continue
-        # clusters under the region (under its dilation within its bounding box + 1 on the second pass)
-        nt = 0
-        if dilate:
-            x0 = xs[order[a]]
-            x1 = x0
-            y0 = ys[order[a]]
-            y1 = y0
-            for e in range(a, b):
-                i = order[e]
-                x0 = min(x0, xs[i])
-                x1 = max(x1, xs[i])
-                y0 = min(y0, ys[i])
-                y1 = max(y1, ys[i])
-            rx0 = max(x0 - 1, 0)
-            rx1 = min(x1 + 2, H)
-            ry0 = max(y0 - 1, 0)
-            ry1 = min(y1 + 2, W)
-            for e in range(a, b):
-                i = order[e]
-                for o in range(offs.shape[0]):
-                    px = xs[i] + offs[o, 0]
-                    py = ys[i] + offs[o, 1]
-                    if px < rx0 or px >= rx1 or py < ry0 or py >= ry1:
-                        continue
-                    l = labelmap[px, py]
-                    if l >= 0 and touch[l] == 0:
-                        touch[l] = 1
-                        tl[nt] = l
-                        nt += 1
-        else:
-            for e in range(a, b):
-                i = order[e]
-                l = labelmap[xs[i], ys[i]]
-                if l >= 0 and touch[l] == 0:
-                    touch[l] = 1
-                    tl[nt] = l
-                    nt += 1
-        for q in range(nt):
-            touch[tl[q]] = 0
+        t0 = tbase[lab]
+        nt = _touched(a, b, dilate, offs, order, xs, ys, labelmap, tl[t0:tbase[lab + 1]])
+        tn[lab] = nt
+        if nt >= 2:
+            _split(tl[t0:t0 + nt], nt, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y,
+                   cx[t0:t0 + nt], cy[t0:t0 + nt], cnt[t0:t0 + nt], clg[t0:t0 + nt], asg, two)
+
+    # 4. resolution, ascending labels
+    assigned = np.zeros(n_lab + 1, np.uint8)
+    j_lab = np.empty(tl.size, np.int64)
+    j_s = np.empty(tl.size, np.int64)
+    j_c = np.empty(tl.size, np.int64)  # -1: all events of the region, else the events with asg == c
+    j_ap = np.zeros(tl.size + 1, np.int64)  # offsets of the active-pixel entries of every job
+    j_lg = np.zeros(tl.size + 1, np.int64)  # offsets of the history entries
+    nj = 0
+    for lab in range(1, n_lab + 1):
+        nt = tn[lab]
         if nt == 0:
             continue
-        assigned[lab] = 1
-
-        if nt == 1:
-            ns = b - a
-            for e in range(a, b):
-                sel[e - a] = order[e]
-            nap, nent, nlog = _update(tl[0], sel, ns, k, xs, ys, Xw, Yw, Tw, indw, labelmap, ap_off, ap_len,
-                                      ap_x, ap_y, steps, inactive_k, x_m, y_m, t_m, tid, mark, fx, fy, ft,
-                                      nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, log_tid, log_ind, nlog)
+        t0 = tbase[lab]
+        ne = 0
+        for q in range(nt):
+            if mark[tl[t0 + q]] == 0:
+                tl[t0 + ne] = tl[t0 + q]  # free clusters to the front, still ascending
+                ne += 1
+        if ne == 0:
             continue
-
-        # several clusters: split the region between their centres (mean of their active pixels)
-        cl = tl[:nt]
-        cl.sort()
-        for c in range(nt):
-            s = cl[c]
-            sx = 0.0
-            sy = 0.0
-            for p in range(ap_off[s], ap_off[s] + ap_len[s]):
-                sx += ap_x[p]
-                sy += ap_y[p]
-            cx[c] = sx / ap_len[s]
-            cy[c] = sy / ap_len[s]
-        # centres closer than 4 px to another centre are moved out of reach (pdist / squareform, d < 4)
-        for c in range(nt):
-            far[c] = False
-            cnt[c] = 0
-        for c in range(nt):
-            for d in range(c + 1, nt):
-                dx = cx[c] - cx[d]
-                dy = cy[c] - cy[d]
-                if np.sqrt(dx * dx + dy * dy) < 4:
-                    far[c] = True
-                    far[d] = True
-        for c in range(nt):
-            if far[c]:
-                cx[c] = -1000.0
-                cy[c] = -1000.0
-        for e in range(a, b):
-            i = order[e]
-            best = 0
-            bd = 0.0
-            for c in range(nt):
-                dd = (xs[i] - cx[c]) ** two + (ys[i] - cy[c]) ** two
-                if c == 0 or dd < bd:  # np.argmin: first minimum
-                    bd = dd
-                    best = c
-            asg[e - a] = best
-            cnt[best] += 1
+        assigned[lab] = 1
+        a = off[lab]
+        b = off[lab + 1]
+        if ne == 1:
+            s = tl[t0]
+            mark[s] = 1
+            j_lab[nj] = lab
+            j_s[nj] = s
+            j_c[nj] = -1
+            j_ap[nj + 1] = j_ap[nj] + b - a
+            j_lg[nj + 1] = j_lg[nj] + reg_lg[lab]
+            nj += 1
+            continue
+        if ne < nt:
+            _split(tl[t0:t0 + ne], ne, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y,
+                   cx[t0:t0 + ne], cy[t0:t0 + ne], cnt[t0:t0 + ne], clg[t0:t0 + ne], asg, two)
         # clusters with at least 4 events take them; label 0 means "unassigned", so slot 0 never takes part
-        for c in range(nt):
-            s = cl[c]
-            if s == 0 or cnt[c] < 4:
+        for c in range(ne):
+            s = tl[t0 + c]
+            if s == 0 or cnt[t0 + c] < 4:
                 continue
-            ns = 0
-            for e in range(a, b):
-                if asg[e - a] == c:
-                    sel[ns] = order[e]
-                    ns += 1
-            nap, nent, nlog = _update(s, sel, ns, k, xs, ys, Xw, Yw, Tw, indw, labelmap, ap_off, ap_len,
-                                      ap_x, ap_y, steps, inactive_k, x_m, y_m, t_m, tid, mark, fx, fy, ft,
-                                      nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, log_tid, log_ind, nlog)
+            mark[s] = 1
+            j_lab[nj] = lab
+            j_s[nj] = s
+            j_c[nj] = c
+            j_ap[nj + 1] = j_ap[nj] + cnt[t0 + c]
+            j_lg[nj + 1] = j_lg[nj] + clg[t0 + c]
+            nj += 1
 
-    # valid clusters that matched no region stop (valid = 0, inactive_k = k)
-    for j in range(nv):
+    # 5. jobs
+    fx = np.empty(j_ap[nj])
+    fy = np.empty(j_ap[nj])
+    ft = np.empty(j_ap[nj])
+    for j in prange(nj):
+        lab = j_lab[j]
+        s = j_s[j]
+        c = j_c[j]
+        p0 = j_ap[j]
+        p = p0
+        g = j_lg[j]
+        for e in range(off[lab], off[lab + 1]):
+            if c >= 0 and asg[e] != c:
+                continue
+            i = order[e]
+            fx[p] = Xw[i]
+            fy[p] = Yw[i]
+            ft[p] = Tw[i]
+            if Tw[i] >= 0:
+                log_ind[g] = indw[i]
+                g += 1
+            nap_x[p] = xs[i]
+            nap_y[p] = ys[i]
+            p += 1
+        ns = p - p0
+        # the medians include the overlap events (T = -1), as before
+        x_m[s] = _median(fx[p0:p], ns)
+        y_m[s] = _median(fy[p0:p], ns)
+        t_m[s] = _median(ft[p0:p], ns) * 1e-6
+        ent_slot[j] = s
+        ent_off[j] = p0
+        ent_len[j] = ns
+        ent_lg[j] = g - j_lg[j]
+        steps[s] += 1
+        inactive_k[s] = k
+
+    # valid clusters that matched no region stop (valid = 0, inactive_k = k); the label map is cleared. Every
+    # cluster that took events is in the label map, so a valid one: its mark is cleared here
+    for j in prange(nv):
         s = vlist[j]
         if mark[s] == 0:
             inactive_k[s] = k
+        mark[s] = 0
         for p in range(ap_off[s], ap_off[s] + ap_len[s]):
             labelmap[ap_x[p], ap_y[p]] = -1
-    for e in range(nent):
-        mark[ent_slot[e]] = 0
 
     # unmatched regions with more than 5 events of this step (T > 0) start new clusters, ascending labels
     nn = 0
     for lab in range(1, n_lab + 1):
-        a = off[lab]
-        b = off[lab + 1]
-        if assigned[lab] or a == b:
-            continue
-        c = 0
-        for e in range(a, b):
-            if Tw[order[e]] > 0:
-                c += 1
-        if c > 5:
+        if assigned[lab] == 0 and reg_new[lab] > 5:
             newlabs[nn] = lab
             nn += 1
-    return nap, nent, nlog, nn
+    return j_ap[nj], nj, j_lg[nj], nn
 
 
-@njit(cache=True, nogil=True)
+@njit(cache=True, nogil=True, parallel=True)
 def _create(k, newlabs, nn, order, off, xs, ys, Xw, Yw, Tw, indw, heap, heap_n,
             steps, inactive, inactive_k, x_m, y_m, t_m, tid, next_tid,
-            nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, log_tid, log_ind, nlog, cand, cand_n):
-    """New clusters in the lowest free slots (refil[m]), ascending region label."""
-    nmax = 1
+            nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, ent_lg, log_ind, nlog, cand, cand_n, reg_lg):
+    """New clusters in the lowest free slots (refil[m]), ascending region label.
+
+    The slots come from the free-slot heap (sequential); the clusters are then filled in parallel, each at offsets
+    computed from the region sizes, so the entries are where the sequential loop put them.
+    """
+    slot = np.empty(nn, np.int64)
     for q in range(nn):
-        nmax = max(nmax, off[newlabs[q] + 1] - off[newlabs[q]])
-    fx = np.empty(nmax)
-    fy = np.empty(nmax)
-    ft = np.empty(nmax)
+        slot[q], heap_n = _heap_pop(heap, heap_n)
+    q_ap = np.zeros(nn + 1, np.int64)
+    q_lg = np.zeros(nn + 1, np.int64)
     for q in range(nn):
         lab = newlabs[q]
-        r, heap_n = _heap_pop(heap, heap_n)
-        tid[r] = next_tid
-        next_tid += 1
-        ent_slot[nent] = r
-        ent_off[nent] = nap
+        q_ap[q + 1] = q_ap[q] + off[lab + 1] - off[lab]
+        q_lg[q + 1] = q_lg[q] + reg_lg[lab]  # events with T >= 0 (counted by _match)
+    fx = np.empty(q_ap[nn])
+    fy = np.empty(q_ap[nn])
+    ft = np.empty(q_ap[nn])
+    for q in prange(nn):
+        lab = newlabs[q]
+        r = slot[q]
+        t = next_tid + q
+        tid[r] = t
+        f0 = q_ap[q]
         m = 0
+        g = nlog + q_lg[q]
+        p = nap + q_ap[q]
         for e in range(off[lab], off[lab + 1]):
             i = order[e]
             if Tw[i] >= 0:  # history and medians without the overlap events
-                fx[m] = Xw[i]
-                fy[m] = Yw[i]
-                ft[m] = Tw[i]
+                fx[f0 + m] = Xw[i]
+                fy[f0 + m] = Yw[i]
+                ft[f0 + m] = Tw[i]
                 m += 1
-                log_tid[nlog] = next_tid - 1
-                log_ind[nlog] = indw[i]
-                nlog += 1
-            nap_x[nap] = xs[i]  # active pixels: all events of the region
-            nap_y[nap] = ys[i]
-            nap += 1
-        ent_len[nent] = nap - ent_off[nent]
-        nent += 1
-        x_m[r] = _median(fx, m)
-        y_m[r] = _median(fy, m)
-        t_m[r] = _median(ft, m) * 1e-6
+                log_ind[g] = indw[i]
+                g += 1
+            nap_x[p] = xs[i]  # active pixels: all events of the region
+            nap_y[p] = ys[i]
+            p += 1
+        ent_slot[nent + q] = r
+        ent_off[nent + q] = nap + q_ap[q]
+        ent_len[nent + q] = q_ap[q + 1] - q_ap[q]
+        ent_lg[nent + q] = m
+        x_m[r] = _median(fx[f0:f0 + m], m)
+        y_m[r] = _median(fy[f0:f0 + m], m)
+        t_m[r] = _median(ft[f0:f0 + m], m) * 1e-6
         steps[r] = 1
         inactive[r] = 0
         inactive_k[r] = k
-        cand[cand_n] = r
-        cand_n += 1
-    return heap_n, next_tid, nap, nent, nlog, cand_n
+    for q in range(nn):
+        cand[cand_n + q] = slot[q]
+    return heap_n, next_tid + nn, nap + q_ap[nn], nent + nn, nlog + q_lg[nn], cand_n + nn
 
 
 @njit(cache=True, nogil=True)
@@ -493,9 +602,13 @@ def _release(k, thresh, cand, cand_n, steps, inactive, inactive_k, heap, heap_n)
     return w, heap_n
 
 
-@njit(cache=True, nogil=True)
-def _assemble(log_tid, log_ind, tid):
-    """Indices of the live tracks grouped by slot, in log (= append) order: ind[off[s]:off[s + 1]] for slot s."""
+@njit(cache=True, nogil=True, parallel=True)
+def _assemble(log_ind, run_tid, run_len, tid):
+    """Indices of the live tracks grouped by slot, in log (= append) order: ind[off[s]:off[s + 1]] for slot s.
+
+    The log is a sequence of runs: run r is run_len[r] consecutive entries of log_ind, of track run_tid[r]. The
+    runs are placed sequentially (a few per cluster and step), their entries copied in parallel.
+    """
     n_slots = tid.size
     n_tid = 0
     for s in range(n_slots):
@@ -504,21 +617,35 @@ def _assemble(log_tid, log_ind, tid):
     for s in range(n_slots):
         if tid[s] >= 0:
             slot_of[tid[s]] = s
+    nr = run_tid.size
+    src = np.empty(nr + 1, np.int64)
+    src[0] = 0
+    for r in range(nr):
+        src[r + 1] = src[r] + run_len[r]
+    rslot = np.empty(nr, np.int64)
     off = np.zeros(n_slots + 1, np.int64)
-    for j in range(log_tid.size):
-        t = log_tid[j]
-        if t < n_tid and slot_of[t] >= 0:
-            off[slot_of[t] + 1] += 1
+    for r in range(nr):
+        t = run_tid[r]
+        sl = slot_of[t] if t < n_tid else -1
+        rslot[r] = sl
+        if sl >= 0:
+            off[sl + 1] += run_len[r]
     for s in range(n_slots):
         off[s + 1] += off[s]
+    dest = np.empty(nr, np.int64)
     pos = off[:-1].copy()
+    for r in range(nr):
+        sl = rslot[r]
+        if sl >= 0:
+            dest[r] = pos[sl]
+            pos[sl] += run_len[r]
     ind = np.empty(off[n_slots], np.int64)
-    for j in range(log_tid.size):
-        t = log_tid[j]
-        if t < n_tid and slot_of[t] >= 0:
-            s = slot_of[t]
-            ind[pos[s]] = log_ind[j]
-            pos[s] += 1
+    for r in prange(nr):
+        if rslot[r] >= 0:
+            d = dest[r]
+            a = src[r]
+            for q in range(run_len[r]):
+                ind[d + q] = log_ind[a + q]
     return ind, off
 
 
@@ -563,7 +690,6 @@ class PixelwiseTracker:
         self.ap_off = np.zeros(n, np.int64)
         self.ap_len = np.zeros(n, np.int64)
         self.mark = np.zeros(n, np.uint8)
-        self.touch = np.zeros(n, np.uint8)
         self.ind_dtype = np.int32 if n_global < 2 ** 31 else np.int64
 
         # clusters started at step 0 (inactive == 0): their history and active pixels
@@ -571,7 +697,9 @@ class PixelwiseTracker:
         self.tid[filled] = np.arange(filled.size)
         self.next_tid = int(filled.size)
         lens = np.array([len(ind_clust[s]) for s in filled], dtype=np.int64)
-        self.log_tid = [np.repeat(np.arange(filled.size, dtype=np.int32), lens)]
+        # history log as runs: run_len[r] consecutive entries of log_ind belong to track run_tid[r]
+        self.run_tid = [np.arange(filled.size, dtype=np.int32)]
+        self.run_len = [lens.astype(np.int32)]
         self.log_ind = [np.concatenate([np.asarray(ind_clust[s], dtype=self.ind_dtype) for s in filled])
                         if filled.size else np.zeros(0, self.ind_dtype)]
         aps = [np.asarray(active_pixels[s]).reshape(-1, 2) for s in filled]
@@ -618,7 +746,6 @@ class PixelwiseTracker:
             self.ap_off = grown(self.ap_off, 0)
             self.ap_len = grown(self.ap_len, 0)
             self.mark = grown(self.mark, 0)
-            self.touch = grown(self.touch, 0)
             heap = np.zeros(cap, np.int64)
             heap[:self.heap_n] = self.heap[:self.heap_n]
             self.heap = heap
@@ -632,23 +759,34 @@ class PixelwiseTracker:
         self.n = new_n
         self.extended = True
 
-    def step(self, k, xs, ys, labels_xy, num_regions, X, Y, T, ind_global):
-        """One time step k > 0. xs, ys: 0-based event pixels; labels_xy: kept region of every event (0 = none)."""
-        order, off = _group(labels_xy, int(num_regions))
+    def step(self, k, xs, ys, order, off, X, Y, T, ind_global):
+        if xs.size < SERIAL_EVENTS:  # waking the kernel threads (~50 us per parallel loop) costs more than it saves
+            numba.set_num_threads(1)
+            try:
+                self._step(k, xs, ys, order, off, X, Y, T, ind_global)
+            finally:
+                _parallel.apply()
+        else:
+            self._step(k, xs, ys, order, off, X, Y, T, ind_global)
+
+    def _step(self, k, xs, ys, order, off, X, Y, T, ind_global):
+        """One time step k > 0. xs, ys: 0-based event pixels; order, off: the events grouped by kept region
+        (_group of label_events: order[off[l]:off[l + 1]] are the events of region l, region 0 = none)."""
         n = xs.size
         nap_x = np.empty(n, np.int32)
         nap_y = np.empty(n, np.int32)
         ent_slot = np.empty(n, np.int64)
         ent_off = np.empty(n, np.int64)
         ent_len = np.empty(n, np.int64)
-        log_tid = np.empty(n, np.int32)
+        ent_lg = np.empty(n, np.int32)
         log_ind = np.empty(n, self.ind_dtype)
-        newlabs = np.empty(int(num_regions) + 1, np.int64)
+        newlabs = np.empty(off.size - 1, np.int64)
+        reg_lg = np.empty(off.size - 1, np.int64)
         nap, nent, nlog, nn = _match(
             k, self.dilate, self.offs, xs, ys, X, Y, T, ind_global, order, off, self.labelmap, self.vlist,
             self.ap_off, self.ap_len, self.ap_x, self.ap_y, self.steps, self.inactive_k,
-            self.x_m, self.y_m, self.t_m, self.tid, self.mark, self.touch,
-            nap_x, nap_y, ent_slot, ent_off, ent_len, log_tid, log_ind, newlabs, 2.0)
+            self.x_m, self.y_m, self.t_m, self.mark,
+            nap_x, nap_y, ent_slot, ent_off, ent_len, ent_lg, log_ind, newlabs, reg_lg, 2.0)
         if nn > 0:
             missing = int(newlabs[nn - 1]) - self.heap_n  # needed = max(idx), the largest new label
             if missing > 0:
@@ -656,8 +794,8 @@ class PixelwiseTracker:
             self.heap_n, self.next_tid, nap, nent, nlog, self.cand_n = _create(
                 k, newlabs, nn, order, off, xs, ys, X, Y, T, ind_global, self.heap, self.heap_n,
                 self.steps, self.inactive, self.inactive_k, self.x_m, self.y_m, self.t_m, self.tid,
-                self.next_tid, nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, log_tid, log_ind, nlog,
-                self.cand, self.cand_n)
+                self.next_tid, nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, ent_lg, log_ind, nlog,
+                self.cand, self.cand_n, reg_lg)
         self.cand_n, self.heap_n = _release(k, self.thresh, self.cand, self.cand_n, self.steps, self.inactive,
                                             self.inactive_k, self.heap, self.heap_n)
         # matched and new clusters are the valid ones of the next step, with their new active pixels
@@ -667,19 +805,22 @@ class PixelwiseTracker:
         self.ap_x = nap_x
         self.ap_y = nap_y
         self.vlist = np.sort(slots)
+        if nent:
+            self.run_tid.append(self.tid[slots].astype(np.int32))  # (a slot's track id does not change in a step)
+            self.run_len.append(ent_lg[:nent].copy())
         if nlog:
-            self.log_tid.append(log_tid[:nlog].copy())
             self.log_ind.append(log_ind[:nlog].copy())
 
     def export(self, X_global, Y_global, T_global):
         """Cluster histories of the pass as PackedTracks (one track per slot, empty for never used slots) and the
         per-slot arrays, as the Python loop leaves them at the end of the pass."""
         n = self.n
-        log_tid = np.concatenate(self.log_tid)
         log_ind = np.concatenate(self.log_ind)
-        self.log_tid = self.log_ind = None
-        ind, off = _assemble(log_tid, log_ind, self.tid[:n])
-        del log_tid, log_ind
+        run_tid = np.concatenate(self.run_tid)
+        run_len = np.concatenate(self.run_len)
+        self.log_ind = self.run_tid = self.run_len = None
+        ind, off = _assemble(log_ind, run_tid, run_len, self.tid[:n])
+        del log_ind, run_tid, run_len
         start, stop = off[:-1], off[1:]
         dtype = self.steps_dtype_extended if self.extended else self.steps_dtype
         return dict(x_clust=PackedTracks(_take(X_global, ind, 1), start, stop),  # X_global[ind] + 1

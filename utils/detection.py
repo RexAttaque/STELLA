@@ -7,8 +7,14 @@ from collections import defaultdict
 from scipy.spatial.distance import pdist, squareform
 from scipy.ndimage import binary_dilation
 import collections
-from pixelwise_numba import PixelwiseTracker, label_events
+from pixelwise_numba import PixelwiseTracker, label_events, dilation_offsets, _group
+try:
+    from utils.parallel import apply as _apply_threads
+except ImportError:
+    from parallel import apply as _apply_threads
+_apply_threads()  # CPU-threads setting of the detection tab, for this (worker) thread
 from concurrent.futures import ThreadPoolExecutor
+import threading
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
@@ -112,36 +118,37 @@ _fast_pixelwise = bool(pixelwise_extension and not pseudo_images and not lightwe
                        and not (max_tracks > 0 and save_mode == False)
                        and globals().get("numba_matching", True))
 _tracker = None
-_next = None  # step k + 1 being prepared while step k is matched
+_pending = collections.deque()  # steps being prepared (in order) while the current one is matched
+_next_k = 1  # next step to submit
 if _fast_pixelwise:
-    _pool = ThreadPoolExecutor(max_workers=1)
-    _pixmap = np.zeros((height, width), dtype=np.int32)  # scratch of label_events
+    _n_prep = 2  # preparing threads: the labelling of a step takes about as long as its matching
+    _pool = ThreadPoolExecutor(max_workers=_n_prep)
+    _tls = threading.local()  # one label_events scratch map per preparing thread
+    _label_offs = dilation_offsets(structure)  # pixels the dilation sets around one pixel ([[0, 0]] for 1x1)
 
 
 def _prepare_fast_step(k):
-    """Events (X, Y, T, ind_global), 0-based pixels and kept region of every event for step k > 0 of the
-    compiled branch. Runs in a worker thread one step ahead: label_events releases the GIL, so the labelling
-    of step k + 1 overlaps the matching of step k."""
+    """Events (X, Y, T, ind_global), 0-based pixels and the events grouped by kept region for step k > 0 of the
+    compiled branch. Runs in a worker thread one step ahead: the compiled labelling (dilation included, same
+    labels as scipy's binary_dilation + label) and grouping release the GIL, so they overlap the matching of
+    step k - 1."""
     X, Y, T, ind_global = _time_window(T_min + (k-overlap) * dt, T_min + (k+1) * dt)
     T[T<T_min+k*dt] = -1
     xs = (X - 1).astype(np.int32)
     ys = (Y - 1).astype(np.int32)
-    if structure.size == 1:  # no dilation: compiled labelling, same labels as scipy below
-        labels_xy, num_regions = label_events(xs, ys, _pixmap, N_pixelwise)
-    else:
-        orig_mask = np.zeros((height, width), dtype=bool)
-        orig_mask[xs, ys] = True
-        labeled, num_regions = label(_dilate(orig_mask))
-        labels_xy = labeled[xs, ys]
-        region_sizes = np.bincount(labels_xy, minlength=num_regions + 1)
-        labels_xy[~(region_sizes >= N_pixelwise)[labels_xy]] = 0
-    return X, Y, T, ind_global, xs, ys, labels_xy, num_regions
+    pixmap = getattr(_tls, "pixmap", None)
+    if pixmap is None:
+        pixmap = _tls.pixmap = np.zeros((height, width), dtype=np.int32)
+    labels_xy, num_regions = label_events(xs, ys, pixmap, N_pixelwise, _label_offs)
+    order, off = _group(labels_xy, int(num_regions))
+    return X, Y, T, ind_global, xs, ys, order, off
 
 
 tic_start_ges = time.time()
 #%% main loop
 for multi in range(multiN):
     _T_sorted = _is_time_sorted(T_global)
+    _next_k = 1
     for k in range(N):
         tic_start = time.time()
         _fast_step = _fast_pixelwise and k > 0
@@ -161,15 +168,15 @@ for multi in range(multiN):
                 T_flat = T.ravel()
 
         if _fast_step:
-            if _next is None:
-                _next = _pool.submit(_prepare_fast_step, k)
-            X, Y, T, ind_global, xs, ys, labels_xy, num_regions = _next.result()
-            _next = _pool.submit(_prepare_fast_step, k + 1) if k + 1 < N else None
+            while len(_pending) <= _n_prep and _next_k < N:  # keep the preparing threads busy, in step order
+                _pending.append(_pool.submit(_prepare_fast_step, _next_k))
+                _next_k += 1
+            X, Y, T, ind_global, xs, ys, _order, _off = _pending.popleft().result()
             if _tracker is None:  # takes over the clusters started at step 0
                 _tracker = PixelwiseTracker(height, width, structure, multi == 1, buffer, len(X_global),
                                             steps, inactive, inactive_k, valid, x_m, y_m, t_m,
                                             active_pixels, ind_clust)
-            _tracker.step(k, xs, ys, labels_xy, num_regions, X, Y, T, ind_global)
+            _tracker.step(k, xs, ys, _order, _off, X, Y, T, ind_global)
         elif k == 0:
             if pseudo_images:
                 centroids, coords = analyze_pseudo_image(X,Y,height,width,area,filtersize)            
@@ -758,9 +765,8 @@ for multi in range(multiN):
         if stop_event is not None and stop_event.is_set():
             break
 
-    if _next is not None:  # a step prepared before a stop request
-        _next.result()
-        _next = None
+    while _pending:  # steps prepared before a stop request
+        _pending.popleft().result()
     if _fast_pixelwise:
         # the compiled branch keeps the clusters as PackedTracks (utils/packed_tracks.py): one flat array per
         # quantity instead of lists of millions of small arrays; same values, track by track

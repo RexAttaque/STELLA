@@ -15,6 +15,10 @@ never overlap. Pickling stores the compact form.
 from collections.abc import Sequence
 
 import numpy as np
+try:  # thread count of the parallel kernels (utils/parallel.py)
+    from utils import parallel as _parallel  # noqa: F401
+except ImportError:  # run with only utils/ on the path
+    import parallel as _parallel  # noqa: F401
 from numba import njit, prange
 
 

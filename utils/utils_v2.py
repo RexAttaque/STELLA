@@ -9,6 +9,10 @@ from skimage.filters import threshold_otsu
 from contextlib import contextmanager
 from joblib.parallel import BatchCompletionCallBack
 from joblib import Parallel
+try:  # thread count of the parallel kernels (utils/parallel.py)
+    from utils import parallel as _parallel  # noqa: F401
+except ImportError:  # run with only utils/ on the path
+    import parallel as _parallel  # noqa: F401
 from numba import njit, prange
 try:
     from utils.packed_tracks import PackedTracks, _gather_chains
