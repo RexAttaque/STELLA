@@ -815,26 +815,30 @@ class ValidationTab:
         t_max = float(np.max(tmaxs))
         
         time_bins = np.arange(t_min, t_max + dt, dt)
-        for t0 in time_bins:
+        binned = self._points_by_time_bin(x_plot, y_plot, x_plotv, y_plotv, t_plot, valid_tracks, time_bins, dt)
+        for b, t0 in enumerate(time_bins):
             t1 = t0 + dt
-    
-            pos, vel, index_map, track_ids = [], [], [], []
-    
-            for i in valid_tracks:
-                ti = np.asarray(t_plot[i], dtype=float)
-                mask = (ti >= t0) & (ti < t1)
-                idxs = np.where(mask)[0]
-                for k in idxs:
-                    vx = float(x_plotv[i][k])
-                    vy = float(y_plotv[i][k])
-                    pos.append((float(x_plot[i][k]), float(y_plot[i][k])))
-                    vel.append((vx, vy))
-                    index_map.append((i, int(k)))
-                    track_ids.append(i)
-    
+
+            if binned is not None:  # all points gathered at once (same points, same order)
+                pos, vel, index_map, track_ids = binned(b)
+            else:
+                pos, vel, index_map, track_ids = [], [], [], []
+
+                for i in valid_tracks:
+                    ti = np.asarray(t_plot[i], dtype=float)
+                    mask = (ti >= t0) & (ti < t1)
+                    idxs = np.where(mask)[0]
+                    for k in idxs:
+                        vx = float(x_plotv[i][k])
+                        vy = float(y_plotv[i][k])
+                        pos.append((float(x_plot[i][k]), float(y_plot[i][k])))
+                        vel.append((vx, vy))
+                        index_map.append((i, int(k)))
+                        track_ids.append(i)
+
             if len(pos) < min_neighbors:
                 continue
-    
+
             pos = np.asarray(pos, dtype=float)
             vel = np.asarray(vel, dtype=float)
             angles = np.arctan2(vel[:, 1], vel[:, 0])
@@ -885,6 +889,56 @@ class ValidationTab:
     
         return point_keep, comp_deviation, dir_deviation, comp_flag, dir_flag
     
+    @staticmethod
+    def _points_by_time_bin(x_plot, y_plot, x_plotv, y_plotv, t_plot, valid_tracks, time_bins, dt):
+        """The points of every time bin [time_bins[b], time_bins[b] + dt), gathered once for all bins instead of
+        scanning every track for every bin (tracks x bins Python iterations).
+
+        Returns a function b -> (pos, vel, index_map, track_ids) with the same points in the same order (ascending
+        track, then point) as the scan, or None when some track's arrays have different lengths (the scan, which
+        indexes them point by point, is then kept).
+        """
+        lens = []
+        for i in valid_tracks:
+            n = len(t_plot[i])
+            if not (len(x_plot[i]) == len(y_plot[i]) == len(x_plotv[i]) == len(y_plotv[i]) == n):
+                return None
+            lens.append(n)
+        lens = np.asarray(lens, dtype=np.int64)
+        tracks = np.asarray(valid_tracks, dtype=np.int64)
+        T = np.concatenate([np.asarray(t_plot[i], dtype=float).ravel() for i in valid_tracks])
+        cols = [np.concatenate([np.asarray(a[i], dtype=float).ravel() for i in valid_tracks])
+                for a in (x_plot, y_plot, x_plotv, y_plotv)]
+        tid = np.repeat(tracks, lens)
+        kk = np.arange(T.size) - np.repeat(np.cumsum(lens) - lens, lens)
+        # bin candidates around (t - t0) / dt, kept where time_bins[b] <= t < time_bins[b] + dt (the scan's test)
+        nb = len(time_bins)
+        fin = np.isfinite(T)
+        base = np.zeros(T.size, dtype=np.int64)
+        base[fin] = np.floor((T[fin] - time_bins[0]) / dt).astype(np.int64)
+        parts = []
+        for d in (-1, 0, 1):
+            b = base + d
+            ok = fin & (b >= 0) & (b < nb)
+            pts = np.flatnonzero(ok)
+            t0 = time_bins[b[pts]]
+            hit = (T[pts] >= t0) & (T[pts] < t0 + dt)
+            parts.append((b[pts][hit], pts[hit]))
+        bins = np.concatenate([p[0] for p in parts])
+        pts = np.concatenate([p[1] for p in parts])
+        order = np.lexsort((pts, bins))  # by bin, then by point (= ascending track, then point)
+        bins, pts = bins[order], pts[order]
+        starts = np.searchsorted(bins, np.arange(nb + 1))
+
+        def points(b):
+            sel = pts[starts[b]:starts[b + 1]]
+            pos = np.column_stack((cols[0][sel], cols[1][sel]))
+            vel = np.column_stack((cols[2][sel], cols[3][sel]))
+            index_map = list(zip(tid[sel].tolist(), kk[sel].tolist()))
+            return pos, vel, index_map, tid[sel].tolist()
+
+        return points
+
     @staticmethod
     def _apply_point_mask(data, masks):
         return [d[m] for d, m in zip(data, masks)]
