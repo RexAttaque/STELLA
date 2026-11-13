@@ -120,6 +120,8 @@ class DetectionTab:
         self._run_thread = None
         
         self._last_refresh_signature = None
+        self._preview = None  # (test result, its clusters a full run would discard, summary)
+        self._cluster_grey_mask = None  # pixels of those clusters in the event-cluster image
         self._refresh_in_progress = False
         self._plotted_signature = None  # what the plots show (see _plot_signature)
         self._overlay_pseudoframe_texture_tag = "detection_pseudoframe_overlay_texture"
@@ -878,8 +880,14 @@ class DetectionTab:
             try:
                 dpg.set_value("det_test_run_stats", "-")
                 out = self.engine.run(ctx)
-                self.last_result = out
                 self._status_log_append("Test run done.")
+                try:
+                    self._preview = (out, *self._full_run_preview(ctx, out))
+                    self._status_log_append(f"[DETECTION] {self._preview[2]}")
+                except Exception as e:
+                    self._preview = None
+                    self._status_log_append(f"[DETECTION] Full-run preview failed: {e}")
+                self.last_result = out
 
                 pt = self.preprocessing_tab
                 events = pt.filtered_events if pt.filtered_events is not None else pt.raw_events
@@ -903,7 +911,8 @@ class DetectionTab:
                 I = self._build_cluster_image(
                     out.x_clust, out.y_clust, out.t_clust,
                     height=height, width=width,
-                    T_min=T_min, T_max=T_max
+                    T_min=T_min, T_max=T_max,
+                    dropped=self._dropped_clusters(out),
                 )
                 
                 W, H = 1280, 720
@@ -918,6 +927,8 @@ class DetectionTab:
                 self._status_log_append("Plots are ready.")
 
                 stats_text = self._compute_detection_stats_text(out, ctx, mode="test")
+                if self._preview is not None and self._preview[0] is out:
+                    stats_text += "\n" + self._preview[2]
                 if dpg.does_item_exist("det_test_run_stats"):
                     dpg.set_value("det_test_run_stats", stats_text)
 
@@ -990,7 +1001,8 @@ class DetectionTab:
                 I = self._build_cluster_image(
                     out.x_clust, out.y_clust, out.t_clust,
                     height=height, width=width,
-                    T_min=T_min, T_max=T_max
+                    T_min=T_min, T_max=T_max,
+                    dropped=self._dropped_clusters(out),
                 )
                 
                 W, H = 1280, 720
@@ -1277,6 +1289,9 @@ class DetectionTab:
         img = scalar_rgba(I[::-1])
         h, w = min(H, img.shape[0]), min(W, img.shape[1])
         rgba[:h, :w] = img[:h, :w]
+        grey = self._cluster_grey_mask
+        if grey is not None and grey.shape == I.shape:  # clusters a full run would discard (test-run preview)
+            rgba[:h, :w][grey[::-1][:h, :w]] = (0.55, 0.55, 0.55, 1.0)
         dpg.set_value(self.cluster_texture_tag, rgba.ravel())
 
     def _clusters_in_window(self, t_clust, T_min, T_max):
@@ -1304,8 +1319,48 @@ class DetectionTab:
         _, _, tmin, tmax = cache
         return np.flatnonzero((tmax >= T_min) & (tmin <= T_max))
 
-    def _build_cluster_image(self, x_clust, y_clust, t_clust, height, width, T_min, T_max):
+    def _dropped_clusters(self, out):
+        """Clusters of `out` that a full run would discard (test-run preview), or None."""
+        if self._preview is not None and self._preview[0] is out:
+            return self._preview[1]
+        return None
+
+    def _full_run_preview(self, test_ctx, test_out):
+        """Which clusters of a test run (one time step) a full run would discard.
+
+        A full run keeps a cluster only if it was followed over at least min_steps steps and holds at least
+        min_events events: one step cannot tell. The full-run logic is run on the steps around the displayed one
+        (min_steps + 1 on each side: any run of min_steps steps through the displayed one lies inside), and a test
+        cluster counts as kept when most of its events belong to a cluster that this run keeps. Approximate: the
+        clusters are cut at the window border (fewer events and steps than over the whole recording).
+        Returns (indices of the discarded test clusters, summary text)."""
+        min_steps = int(self.params.get("min_steps", 3))
+        margin = min_steps + 1
+        dt = float(test_ctx["dt"])
+        ctx = self._build_engine_context()
+        ctx["test_mode"] = False
+        ctx["N"] = 2 * margin + 1
+        ctx["t_start"] = float(test_ctx.get("t_start", 0.0)) - margin * dt
+        full = self.engine.run(ctx)
+        kept = [np.asarray(a).ravel() for a in full.ind_clust if len(a)]
+        kept = np.unique(np.concatenate(kept)) if kept else np.zeros(0, dtype=np.int64)
+        dropped = set()
+        n = 0
+        for i, ind in enumerate(test_out.ind_clust):
+            ind = np.asarray(ind).ravel()
+            if ind.size == 0:
+                continue
+            n += 1
+            if np.count_nonzero(np.isin(ind, kept)) * 2 < ind.size:
+                dropped.add(i)
+        summary = (f"Full-run preview: {n - len(dropped)} of {n} clusters kept, {len(dropped)} discarded (grey) "
+                   f"by the min. {min_steps} steps / {int(self.params.get('min_events', 20))} events rules")
+        return dropped, summary
+
+    def _build_cluster_image(self, x_clust, y_clust, t_clust, height, width, T_min, T_max, dropped=None):
+        """Cluster labels image; the pixels of the `dropped` clusters go to self._cluster_grey_mask instead."""
         I = np.zeros((width, height), dtype=np.uint8)
+        grey = np.zeros((width, height), dtype=bool) if dropped else None
 
         for ci in self._clusters_in_window(t_clust, T_min, T_max):
             xc, yc, tc = x_clust[ci], y_clust[ci], t_clust[ci]
@@ -1333,9 +1388,13 @@ class DetectionTab:
             if xi.size == 0:
                 continue
 
+            if grey is not None and ci in dropped:
+                grey[-yi + (width - 1), xi] = True
+                continue
             color = np.random.randint(1, 256)
             I[-yi + (width - 1), xi] = color
-    
+
+        self._cluster_grey_mask = grey
         return I
     
     def _ensure_cluster_texture_size(self, width: int, height: int) -> None:
@@ -1682,7 +1741,8 @@ class DetectionTab:
                 I = self._build_cluster_image(
                     out.x_clust, out.y_clust, out.t_clust,
                     height=height, width=width,
-                    T_min=T_min, T_max=T_max
+                    T_min=T_min, T_max=T_max,
+                    dropped=self._dropped_clusters(out),
                 )
     
             W, H = 1280, 720
