@@ -25,7 +25,7 @@ except NameError:
 try:
     structure_size
 except NameError:
-    structure_size = 1
+    structure_size = 3
 
 # A cluster is kept only if it was followed over at least min_steps time steps and holds at least min_events events.
 # During the run, a cluster younger than min_steps that was not extended for 2 steps is retired (its slot reused).

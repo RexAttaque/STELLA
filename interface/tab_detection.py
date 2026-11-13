@@ -97,7 +97,7 @@ class DetectionTab:
         self._run_button_tag = "det_run_button"
         self.params.setdefault("N_pixelwise", 5)
         self.params.setdefault("overlap", 0.4)
-        self.params.setdefault("structure_size", 1)
+        self.params.setdefault("structure_size", 3)  # 3x3 dilation: joins the small gaps along fast streaks
         self.params.setdefault("min_steps", 3)    # a kept cluster spans at least this many time steps
         self.params.setdefault("min_events", 20)  # and holds at least this many events
         
@@ -305,7 +305,7 @@ class DetectionTab:
             with dpg.group(horizontal=True):
                 dpg.add_input_int(
                     label="mask size",
-                    default_value=int(self.params.get("structure_size", 1)),
+                    default_value=int(self.params.get("structure_size", 3)),
                     min_value=1,
                     min_clamped=True,
                     width=150,
@@ -813,7 +813,7 @@ class DetectionTab:
             "N": int(self.params.get("N", 1)),
             "multiN": multiN,
             "overlap": float(self.params.get("overlap", 0.4)),
-            "structure_size": int(self.params.get("structure_size", 1)),
+            "structure_size": int(self.params.get("structure_size", 3)),
             "min_steps": int(self.params.get("min_steps", 3)),
             "min_events": int(self.params.get("min_events", 20)),
     
