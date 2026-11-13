@@ -14,7 +14,7 @@ from config.constants import (
     SUPPORTED_FORMATS,
 )
 from utils.paths import default_files_dir
-from utils.masks import MASK_MODES, keep_map, load_masks, save_masks
+from utils.masks import MASK_MODES, Mask, keep_map, load_masks, save_masks
 from interface.mask_editor import PolygonMaskEditor
 from utils.dataloader import build_preview_and_stats, load_data_file
 from utils.helpers import EventDataHelper
@@ -64,6 +64,8 @@ class PreprocessingTab:
         self._geometry_listeners = []  # called with (sensor w, h, display w, h) when the sensor size changes
         self.masks = []  # polygon masks (utils/masks.py), applied to the events by apply_event_filters
         self._mask_editor = None
+        # (mask, state) of the masks the events are filtered with: edits wait for the apply button
+        self._applied_masks = []
         self.last_loaded_data: Any = None
         self.display_t0: float | None = None
         self.raw_events: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]] = None
@@ -187,9 +189,11 @@ class PreprocessingTab:
             dpg.add_button(label="Save...", callback=self.on_save_masks_clicked, width=70)
         dpg.add_text("Draw polygons on the pseudo-frame. 'exclude' removes the events inside, 'keep' keeps only the "
                      "events inside the keep masks. Enabled masks apply to the whole chain (detection, tracking, "
-                     "validation). Click a mask to select it, drag its points, right click a point to delete it.",
+                     "validation). Click a mask to select it, drag its points, right click a point to delete it. "
+                     "Changes (marked *) take effect when 'apply' (on the selected mask's row) is pressed.",
                      wrap=430, color=(160, 160, 160))
         dpg.add_group(tag="masks_list")
+        dpg.add_text("", tag="masks_pending", wrap=430, color=(255, 190, 80))
         dpg.add_text("", tag="masks_status", wrap=430, color=(100, 255, 100))
         dpg.add_separator()
         dpg.add_text("Time range:", color=(200, 200, 100))
@@ -295,7 +299,7 @@ class PreprocessingTab:
         self._mask_editor = PolygonMaskEditor(
             "preprocessing_pf_drawlist", "preprocessing_masks_node", self.masks,
             geometry=lambda: (*self.sensor_size(), *self.display_size()), zoom=self.view_zoom,
-            on_change=self._on_masks_changed, on_message=self._mask_message)
+            on_change=self._on_masks_changed, on_message=self._mask_message, pending=self._mask_pending)
         self.view_zoom.register("preprocessing_pf_drawlist", self._apply_view_zoom)
         self.register_geometry_listener(self._on_own_geometry)
         dpg.add_text("Load data to generate pseudo-frame.", tag="preprocessing_pseudoframe_status", wrap=730)
@@ -448,7 +452,7 @@ class PreprocessingTab:
             inside = (X >= 0) & (X < W) & (Y >= 0) & (Y < H)
             n_outside = int(inside.size - np.count_nonzero(inside))
             _and(inside)
-        keep = keep_map(self.masks, W, H)
+        keep = keep_map(self._applied_mask_list(), W, H)  # (not the edits waiting for 'apply')
         if keep is not None and X.size:
             _and(keep[np.clip(Y, 0, H - 1).astype(np.intp), np.clip(X, 0, W - 1).astype(np.intp)])
         polarity = self.params.get("polarity", POLARITY_OPTIONS[0])
@@ -468,9 +472,10 @@ class PreprocessingTab:
         if n_outside:
             self.log_status(f"{n_outside} events outside the {W} x {H} sensor removed: check the sensor size")
         if dpg.does_item_exist("masks_status"):
-            n_on = sum(1 for m in self.masks if m.enabled and len(m.points) >= 3)
-            dpg.set_value("masks_status", f"{len(self.masks)} mask(s), {n_on} enabled: {Xf.size} of {len(xs)} "
-                                          f"events kept" if self.masks else "")
+            applied = self._applied_mask_list()
+            n_on = sum(1 for m in applied if m.enabled and len(m.points) >= 3)
+            dpg.set_value("masks_status", f"{n_on} mask(s) applied: {Xf.size} of {len(xs)} events kept"
+                                          if applied else "")
 
     # ------------------------------------------------------------------
     # Sensor size and polarity
@@ -550,32 +555,75 @@ class PreprocessingTab:
         if self._mask_editor is not None:
             self._mask_editor.start_drawing()
 
+    @staticmethod
+    def _mask_state(m):
+        """What of a mask acts on the events (not its name)."""
+        return tuple(tuple(float(c) for c in p) for p in m.points), bool(m.enabled), str(m.mode)
+
+    def _applied_mask_list(self):
+        return [Mask(m.name, [list(p) for p in st[0]], st[1], st[2]) for m, st in self._applied_masks]
+
+    def _mask_pending(self, m) -> bool:
+        """Whether mask m has changes that are not applied yet."""
+        st = next((st for a, st in self._applied_masks if a is m), None)
+        if st is None:  # new mask: it changes the events once it is enabled and closed
+            return bool(m.enabled and len(m.points) >= 3)
+        return st != self._mask_state(m)
+
+    def _masks_pending(self) -> bool:
+        removed = any(st[1] and len(st[0]) >= 3 for a, st in self._applied_masks
+                      if not any(a is m for m in self.masks))
+        return removed or any(self._mask_pending(m) for m in self.masks)
+
     def _on_masks_changed(self, committed: bool) -> None:
-        """committed: the masks changed (filter the events again); otherwise only the selection did."""
+        """committed: the masks were edited (waiting for 'apply'); otherwise only the selection changed."""
         self._rebuild_masks_list()
-        if committed and getattr(self, "raw_events", None):
-            self.apply_event_filters()
-            self.update_pseudoframe_from_data("Masks applied.")
         if self._mask_editor is not None:
             self._mask_editor.redraw()
+
+    def _on_masks_apply(self, sender=None, app_data=None, user_data=None) -> None:
+        """Filters the events with the masks as they are now."""
+        self._applied_masks = [(m, self._mask_state(m)) for m in self.masks]
+        self._rebuild_masks_list()
+        if getattr(self, "raw_events", None):
+            self.apply_event_filters()
+            self.update_pseudoframe_from_data("Masks applied.")
+        else:
+            self._mask_message("Masks applied (they act on the events once data is loaded).")
+        if self._mask_editor is not None:
+            self._mask_editor.redraw()
+
+    def _select_mask(self, index) -> None:
+        if self._mask_editor is not None and self._mask_editor.selected != index:
+            self._mask_editor.select(index)
 
     def _rebuild_masks_list(self) -> None:
         if not dpg.does_item_exist("masks_list"):
             return
         dpg.delete_item("masks_list", children_only=True)
         selected = self._mask_editor.selected if self._mask_editor is not None else -1
+        pending = self._masks_pending()
         for i, m in enumerate(self.masks):
             with dpg.group(horizontal=True, parent="masks_list"):
+                dpg.add_text("*" if self._mask_pending(m) else " ", color=(255, 190, 80))
                 dpg.add_checkbox(default_value=m.enabled, user_data=i, callback=self._on_mask_enabled)
                 dpg.add_input_text(default_value=m.name, width=130, user_data=i, callback=self._on_mask_renamed)
                 dpg.add_combo(items=list(MASK_MODES), default_value=m.mode, width=90, user_data=i,
                               callback=self._on_mask_mode)
-                dpg.add_button(label="selected" if i == selected else "select", width=70, user_data=i,
-                               callback=lambda s, a, u: (self._mask_editor.select(u), self._rebuild_masks_list()))
+                if i == selected:
+                    dpg.add_button(label="apply", width=70, tag="masks_apply_button", enabled=pending,
+                                   callback=self._on_masks_apply)
+                else:
+                    dpg.add_button(label="select", width=70, user_data=i,
+                                   callback=lambda s, a, u: (self._select_mask(u), self._rebuild_masks_list()))
                 dpg.add_button(label="X", width=25, user_data=i, callback=self._on_mask_deleted)
+        if dpg.does_item_exist("masks_pending"):
+            dpg.set_value("masks_pending", "Changes not applied yet (*): press 'apply' on the selected mask."
+                          if pending else "")
 
     def _on_mask_enabled(self, sender, app_data, user_data) -> None:
         self.masks[user_data].enabled = bool(app_data)
+        self._select_mask(user_data)  # (its row gets the apply button)
         self._on_masks_changed(True)
 
     def _on_mask_renamed(self, sender, app_data, user_data) -> None:
@@ -585,15 +633,29 @@ class PreprocessingTab:
 
     def _on_mask_mode(self, sender, app_data, user_data) -> None:
         self.masks[user_data].mode = str(app_data)
+        self._select_mask(user_data)
         self._on_masks_changed(True)
+
+    def _after_list_change(self, select: int) -> None:
+        """After masks were deleted or loaded: the apply button goes to mask `select`; with no mask left there is no
+        button, so the change is applied at once."""
+        if self.masks:
+            self._select_mask(min(max(select, 0), len(self.masks) - 1))
+            self._on_masks_changed(True)
+        else:
+            self._select_mask(-1)
+            if self._masks_pending():
+                self._on_masks_apply()
+            else:
+                self._on_masks_changed(True)
 
     def _on_mask_deleted(self, sender, app_data, user_data) -> None:
         name = self.masks[user_data].name
         del self.masks[user_data]
         if self._mask_editor is not None:
-            self._mask_editor.select(-1)
-        self._mask_message(f"{name} deleted.")
-        self._on_masks_changed(True)
+            self._mask_editor.selected = -1
+        self._mask_message(f"{name} deleted." + ("" if self.masks else " No mask left: applied."))
+        self._after_list_change(user_data)
 
     def on_save_masks_clicked(self, sender=None, app_data=None, user_data=None) -> None:
         if not self.masks:
@@ -624,9 +686,9 @@ class PreprocessingTab:
             return
         self.masks[:] = loaded  # (the editor holds this list)
         if self._mask_editor is not None:
-            self._mask_editor.select(-1)
-        self._mask_message(f"{len(loaded)} mask(s) loaded from {path}")
-        self._on_masks_changed(True)
+            self._mask_editor.selected = -1
+        self._mask_message(f"{len(loaded)} mask(s) loaded from {path}" + (": press 'apply' to use them." if loaded else ""))
+        self._after_list_change(0)
             
     def update_time_param(self, sender, app_data, user_data):
         self.params[user_data] = float(app_data)

@@ -17,17 +17,18 @@ _DRAFT = (255, 220, 60, 255)
 
 
 class PolygonMaskEditor:
-    def __init__(self, drawlist, node, masks, geometry, zoom, on_change, on_message):
+    def __init__(self, drawlist, node, masks, geometry, zoom, on_change, on_message, pending=None):
         """drawlist / node: the view and the draw node the masks are drawn in; masks: the list of Mask edited in place;
         geometry(): (sensor w, sensor h, display w, display h); zoom: the SharedZoom of the views;
-        on_change(committed): masks changed (committed: an edit is finished, the events must be filtered again);
-        on_message(text): user feedback."""
+        on_change(committed): masks changed (committed: an edit is finished; otherwise only the selection);
+        on_message(text): user feedback; pending(mask): whether it has changes not applied yet (label marked *)."""
         self.drawlist, self.node = drawlist, node
         self.masks = masks
         self.geometry = geometry
         self.zoom = zoom
         self.on_change = on_change
         self.on_message = on_message
+        self.pending = pending
         self.drawing = False
         self.draft = []
         self.selected = -1
@@ -193,7 +194,8 @@ class PolygonMaskEditor:
             color = _COLORS.get(m.mode, _COLORS["exclude"]) if m.enabled else _DISABLED
             selected = i == self.selected
             dpg.draw_polyline(pts + [pts[0]], color=color, thickness=3.0 if selected else 1.5, parent=self.node)
-            dpg.draw_text(pts[0], m.name + ("" if m.enabled else " (off)"), color=color, size=14, parent=self.node)
+            label = m.name + ("" if m.enabled else " (off)") + (" *" if self.pending and self.pending(m) else "")
+            dpg.draw_text(pts[0], label, color=color, size=14, parent=self.node)
             if selected:
                 for x, y in pts:
                     dpg.draw_rectangle([x - 4, y - 4], [x + 4, y + 4], color=(255, 255, 255, 255),
