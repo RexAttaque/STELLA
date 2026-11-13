@@ -327,9 +327,9 @@ class ValidationTab:
 
         dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._pf_status_tag, wrap=1200)
 
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="<< Prev", width=120, callback=self._on_pf_prev)
-            dpg.add_button(label="Next >>", width=120, callback=self._on_pf_next)
+        if self.preprocessing_tab is not None:
+            self.preprocessing_tab.timeline.build("validation", time_info_tag=self._pf_time_info_tag)
+        else:
             dpg.add_text("", tag=self._pf_time_info_tag, wrap=900)
 
         if self.preprocessing_tab is not None:
@@ -465,18 +465,6 @@ class ValidationTab:
         if sig != self._pf_overlay_signature:
             self._pf_overlay_signature = sig
             self._update_validation_overlay()
-
-    def _on_pf_prev(self, sender=None, app_data=None, user_data=None):
-        if self.preprocessing_tab is None:
-            return
-        self.preprocessing_tab.on_prev_pseudoframe(sender, app_data, user_data)
-        self._update_validation_overlay()
-
-    def _on_pf_next(self, sender=None, app_data=None, user_data=None):
-        if self.preprocessing_tab is None:
-            return
-        self.preprocessing_tab.on_next_pseudoframe(sender, app_data, user_data)
-        self._update_validation_overlay()
 
     def _on_run_validation(self, sender=None, app_data=None, user_data=None) -> None:
         if self.tracking_tab is None or getattr(self.tracking_tab, "last_result", None) is None:

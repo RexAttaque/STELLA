@@ -16,6 +16,7 @@ from config.constants import (
 from utils.paths import default_files_dir
 from utils.masks import MASK_MODES, Mask, keep_map, load_masks, save_masks
 from interface.mask_editor import PolygonMaskEditor
+from interface.timeline import Timeline
 from utils.dataloader import build_preview_and_stats, load_data_file
 from utils.helpers import EventDataHelper
 from utils.plots import (
@@ -68,6 +69,7 @@ class PreprocessingTab:
         self._applied_masks = []
         self.last_loaded_data: Any = None
         self.display_t0: float | None = None
+        self.timeline = Timeline(self)  # displayed time step (shared by all pages), range of the recording
         self.raw_events: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]] = None
         self.filtered_events: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]] = None
         self.last_loaded_file_ext: Optional[str] = None
@@ -304,10 +306,7 @@ class PreprocessingTab:
         self.register_geometry_listener(self._on_own_geometry)
         dpg.add_text("Load data to generate pseudo-frame.", tag="preprocessing_pseudoframe_status", wrap=730)
         
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="<< Prev", width=120, callback=self.on_prev_pseudoframe)
-            dpg.add_button(label="Next >>", width=120, callback=self.on_next_pseudoframe)
-            dpg.add_text("", tag="pseudoframe_time_info", wrap=600)
+        self.timeline.build("preprocessing", time_info_tag="pseudoframe_time_info")
 
         dpg.add_separator()
         dpg.add_text("Status Log", color=(200, 200, 100))
@@ -406,6 +405,8 @@ class PreprocessingTab:
             if dpg.does_item_exist("time_tmax"):
                 dpg.set_value("time_tmax", tmax)
     
+            self.timeline.forget_range()
+            self.display_t0 = None  # first step of the new recording
             self.apply_event_filters()
             self.update_pseudoframe_from_data("Data loaded, masks applied.")
             
@@ -859,9 +860,11 @@ class PreprocessingTab:
             I[Y.astype(np.intp), X.astype(np.intp)] = 1.0
 
             self.update_pseudoframe_visualization(I, f"Accumulation preview ({n_window} events).")
+            g = self.timeline.grid()
+            info = f"t = [{T_min:.0f} .. {T_max:.0f}] us" + (f"   step {self.timeline.index(g) + 1} / {g[2]}" if g else "")
             for tag in list(self._pseudoframe_time_info_tags):
                 if dpg.does_item_exist(tag):
-                    dpg.set_value(tag, f"t: [{T_min:.0f} .. {T_max:.0f}] (display window)")
+                    dpg.set_value(tag, info)
         except Exception as exc:
             error_message = f"Pseudo-frame error: {exc}"
             self.log_status(error_message)
@@ -872,37 +875,12 @@ class PreprocessingTab:
         return acc_ms * 1000.0
     
     def on_next_pseudoframe(self, sender=None, app_data=None, user_data=None):
-        self._shift_time_window(+1)
-    
+        self.timeline.step(+1)
+
     def on_prev_pseudoframe(self, sender=None, app_data=None, user_data=None):
-        self._shift_time_window(-1)
-    
-    def _shift_time_window(self, direction: int) -> None:
-        if not self.filtered_events:
-            self.log_status("No filtered events available.")
-            return
-    
-        xs, ys, ts, ps = self.filtered_events
-        acc_ms = float(self.params.get("accumulation_time_ms", 2.0))
-        step = acc_ms * 1000.0
-    
-        if len(ts) == 0:
-            return
-        if self.display_t0 is None:
-            self.display_t0 = float(ts[0])
+        self.timeline.step(-1)
 
-        new_t0 = float(self.display_t0) + direction * step
-
-        data_min = float(ts[0])   # events are time sorted
-        data_max = float(ts[-1])
-        if new_t0 < data_min:
-            new_t0 = data_min
-        if new_t0 + step > data_max:
-            new_t0 = data_max - step
     
-        self.display_t0 = new_t0
-        self.update_pseudoframe_from_data("Display window shifted.")
-
     def render_plot_to_texture(self, fig, texture_tag: str) -> None:  
         try:
             dpg.set_value(texture_tag, figure_to_rgba_flat(fig))

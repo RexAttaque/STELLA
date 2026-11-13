@@ -217,7 +217,7 @@ def install(tabs_by_key, settings_window=None):
                 continue
             alias = dpg.get_item_alias(item)
             label = dpg.get_item_label(item) or ""
-            if alias in _SKIP or label.startswith("##Q_"):
+            if alias in _SKIP or label.startswith("##Q_") or alias.startswith("timeline_"):  # playback speed
                 continue
             if masks_list is not None and _inside(item, masks_list):
                 continue

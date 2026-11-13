@@ -19,7 +19,7 @@ import pickle
 import scipy.io as sio
 from pathlib import Path
 from datetime import datetime
-import sys, io, contextlib, threading, queue
+import sys, io, contextlib, threading, queue, weakref
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -121,6 +121,9 @@ class TrackingTab:
         self._run_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._last_run_ctx: Optional[dict[str, Any]] = None
+        self._source_detection = None  # detection results the tracking results come from (weak reference)
+        if preprocessing_tab is not None:
+            preprocessing_tab.timeline.attach(tracking_tab=self)
         self._track_run_stats_text_tag = "track_run_stats"
         
         self.pseudoframe_dimensions = PSEUDOFAME_DIMENSIONS
@@ -514,9 +517,9 @@ class TrackingTab:
     
         dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._pf_status_tag, wrap=730)
     
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="<< Prev", width=120, callback=self._on_pf_prev)
-            dpg.add_button(label="Next >>", width=120, callback=self._on_pf_next)
+        if self.preprocessing_tab is not None:
+            self.preprocessing_tab.timeline.build("tracking", time_info_tag=self._pf_time_info_tag)
+        else:
             dpg.add_text("", tag=self._pf_time_info_tag, wrap=600)
     
         if self.preprocessing_tab is not None:
@@ -906,6 +909,8 @@ class TrackingTab:
             dpg.set_value(self._run_status_tag, f"Input error: {e}")
             dpg.configure_item(self._run_button_tag, enabled=True)
             return
+        source = self._detection_source()
+        time_range = self.preprocessing_tab.timeline.detection_range() if self.preprocessing_tab else None
 
         def worker():
             stdout_writer = QueueWriter(self._log_queue)
@@ -913,6 +918,12 @@ class TrackingTab:
             try:
                 with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
                     out = self.engine.run(ctx)
+                    if time_range is not None:
+                        try:
+                            out.time_range = tuple(time_range)
+                        except Exception:
+                            pass
+                    self._source_detection = source
                     self.last_result = out
                 self._log_queue.put("[TRACKING] Done.")
             except TrackingCancelled:
@@ -1112,6 +1123,7 @@ class TrackingTab:
             ctx = self._build_engine_context()
             ctx = self._slice_ctx_to_single_cluster(ctx, cluster_idx)
             self._last_run_ctx = ctx
+            source = self._detection_source()
         except Exception as e:
             dpg.set_value(self._run_status_tag, f"Input error: {e}")
             dpg.configure_item(self._run_button_tag, enabled=True)
@@ -1126,6 +1138,7 @@ class TrackingTab:
             try:
                 with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
                     out = self.engine.run(ctx)
+                    self._source_detection = source
                     self.last_result = out
                 self._log_queue.put(f"[TRACKING] Test run done (cluster {cluster_idx}).")
             except TrackingCancelled:
@@ -1139,6 +1152,14 @@ class TrackingTab:
         self._run_thread.start()
         
         
+    def _detection_source(self):
+        """Weak reference to the detection results a run starts from (the timeline tells when they changed)."""
+        det_out = getattr(self.detection_tab, "last_result", None)
+        try:
+            return weakref.ref(det_out) if det_out is not None else None
+        except TypeError:
+            return None
+
     def _slice_ctx_to_single_cluster(self, ctx: dict[str, Any], idx: int) -> dict[str, Any]:
         ctx = dict(ctx)  
 
@@ -1262,18 +1283,6 @@ class TrackingTab:
             self._pf_overlay_signature = sig
             self._update_tracking_pseudoframe_overlay()
 
-    def _on_pf_prev(self, sender=None, app_data=None, user_data=None):
-        if self.preprocessing_tab is None:
-            return
-        self.preprocessing_tab.on_prev_pseudoframe(sender, app_data, user_data)
-        self._update_tracking_pseudoframe_overlay()
-    
-    def _on_pf_next(self, sender=None, app_data=None, user_data=None):
-        if self.preprocessing_tab is None:
-            return
-        self.preprocessing_tab.on_next_pseudoframe(sender, app_data, user_data)
-        self._update_tracking_pseudoframe_overlay()
-        
     def _update_tracking_pseudoframe_overlay(self) -> None:
         if not dpg.does_item_exist(self._pf_tracks_node_tag):
             return
@@ -1628,6 +1637,7 @@ class TrackingTab:
                 raise ValueError("Unsupported file type. Use .npz or .mat.")
     
             self.last_result = pickle.loads(result_bytes)
+            self._source_detection = None  # loaded: not tied to the detection results shown
             self._last_run_ctx = pickle.loads(ctx_bytes)
 
             ctx_params = self._last_run_ctx if isinstance(self._last_run_ctx, dict) else {}

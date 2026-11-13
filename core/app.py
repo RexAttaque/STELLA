@@ -34,6 +34,7 @@ class EVTrackApp:
         while dpg.is_dearpygui_running():
             self.detection_tab.process_background_tasks()
             self.tracking_tab.process_background_tasks()
+            self.preprocessing_tab.timeline.tick()  # slider dragging, playback, bar colours
             self.tracking_tab.sync_pseudoframe_overlay()  # follow the frame shown on the other pages
             self.validation_tab.sync_pseudoframe_overlay()
             dpg.render_dearpygui_frame()

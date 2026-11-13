@@ -81,6 +81,8 @@ T_max = np.max(T_global)
 # optional start time (the test run detects in the frame shown in the GUI)
 if globals().get("t_start", None) is not None:
     T_min = max(T_min, float(t_start))
+# part of the recording (range set in the GUI): no event before t_floor, even in the overlap of the first step
+_t_floor = globals().get("t_floor", None)
 
 
 def _is_time_sorted(T):
@@ -93,6 +95,8 @@ def _time_window(t_lo, t_hi):
     The event stream is time sorted, so the window is found by binary search
     (O(log n)) instead of comparing every event of the recording at every step.
     """
+    if _t_floor is not None:
+        t_lo = max(t_lo, _t_floor)
     if _T_sorted:
         lo = int(np.searchsorted(T_global, t_lo, side="left"))
         hi = max(int(np.searchsorted(T_global, t_hi, side="right")), lo)

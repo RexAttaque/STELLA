@@ -129,6 +129,9 @@ class DetectionTab:
         self._overlay_pseudoframe_texture_tag = "detection_pseudoframe_overlay_texture"
         self._view_zoom = preprocessing_tab.view_zoom if preprocessing_tab is not None else SharedZoom()
         self._last_run_ctx = None
+        if preprocessing_tab is not None:  # results shown on the timeline, N follows its range
+            preprocessing_tab.timeline.attach(detection_tab=self)
+            preprocessing_tab.timeline.add_range_listener(self._on_range_changed)
         self.duration_hist_texture_tag = "det_duration_hist_texture"
         self._texture_registry_tag = "det_texture_registry"        
         
@@ -708,9 +711,9 @@ class DetectionTab:
             "det_pf_drawimage", uv_min=uv_min, uv_max=uv_max))
         dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._status_tag, wrap=730)
 
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="<< Prev", width=120, callback=self._on_prev)
-            dpg.add_button(label="Next >>", width=120, callback=self._on_next)
+        if self.preprocessing_tab is not None:
+            self.preprocessing_tab.timeline.build("detection", time_info_tag=self._time_info_tag)
+        else:
             dpg.add_text("", tag=self._time_info_tag, wrap=600)
 
         if self.preprocessing_tab is not None:
@@ -746,10 +749,7 @@ class DetectionTab:
             autosize_y=True,
             border=False,
         ):
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="<< Prev", width=120, callback=self._on_prev)
-                dpg.add_button(label="Next >>", width=120, callback=self._on_next)
-                dpg.add_text("", tag="det_cluster_time_info", wrap=600)
+            dpg.add_text("", tag="det_cluster_time_info", wrap=600)
             dpg.add_image(
                 texture_tag="det_cluster_plot_texture",
                 tag="det_cluster_plot_image",
@@ -782,18 +782,6 @@ class DetectionTab:
                 tag="det_duration_hist_image",
             )
 
-    def _on_prev(self, sender=None, app_data=None, user_data=None):
-        if self.preprocessing_tab is None:
-            return
-        self.preprocessing_tab.on_prev_pseudoframe(sender, app_data, user_data)
-        self._on_refresh_plots(sender, app_data, user_data)
-
-    def _on_next(self, sender=None, app_data=None, user_data=None):
-        if self.preprocessing_tab is None:
-            return
-        self.preprocessing_tab.on_next_pseudoframe(sender, app_data, user_data)
-        self._on_refresh_plots(sender, app_data, user_data)
-         
     def _build_engine_context(self) -> dict[str, Any]:
         if self.preprocessing_tab is None:
             raise RuntimeError("PreprocessingTab ist nicht verbunden – keine Daten für Detection verfügbar.")
@@ -868,8 +856,29 @@ class DetectionTab:
         # settings of the page and of the Settings window (config/settings.py): cluster rules, track repair,
         # buffer, steps_rev, search_factor, max_tracks, max_length, ...
         ctx.update(STORE.values("Detection"))
-    
+
+        # part of the recording (range set on the timeline): the steps start at its start and use no event
+        # before it (not even in the overlap of the first step); at most its number of steps
+        r = pt.timeline.range_steps()
+        if r is not None:
+            ctx["t_start"] = ctx["t_floor"] = r[0]
+            ctx["N"] = min(int(ctx["N"]), r[2])
         return ctx
+
+    @staticmethod
+    def _run_time_range(ctx: dict) -> tuple[float, float]:
+        """Part of the recording a run with `ctx` covers (us): its steps, from the first event or t_start."""
+        T = ctx["T_global"]
+        lo = float(T[0]) if ctx.get("t_start") is None else max(float(T[0]), float(ctx["t_start"]))
+        return lo, lo + int(ctx["N"]) * float(ctx["dt"])
+
+    def _on_range_changed(self) -> None:
+        """Range of the recording changed on the timeline: the number of steps follows it."""
+        self._n_user_set = False
+        n = self._compute_default_N()
+        self.params["N"] = n
+        if dpg.does_item_exist("det_input_matching_N"):
+            dpg.set_value("det_input_matching_N", n)
 
     def _on_test_run_clicked(self, sender=None, app_data=None, user_data=None):
         self._status_log_append("Test run started for 1 time step...")
@@ -883,6 +892,7 @@ class DetectionTab:
 
             ctx["N"] = 1
             ctx["test_mode"] = True
+            ctx.pop("t_floor", None)  # like the step in a full run: with the overlap events before it
             ctx["multiN"] = 1
             # detect in the displayed frame: the plots only show clusters of that frame
             pt = self.preprocessing_tab
@@ -894,10 +904,13 @@ class DetectionTab:
             dpg.configure_item("det_button_test_run", enabled=True)
             return
     
+        time_range = self._run_time_range(ctx)
+
         def worker():
             try:
                 dpg.set_value("det_test_run_stats", "-")
                 out = self.engine.run(ctx)
+                self._set_time_range(out, time_range)
                 self._status_log_append("Test run done.")
                 try:
                     self._preview = (out, *self._full_run_preview(ctx, out))
@@ -980,7 +993,11 @@ class DetectionTab:
         try:
             ctx = self._build_engine_context()
             ctx["test_mode"] = False
-            self._last_run_ctx = ctx  
+            self._last_run_ctx = ctx
+            time_range = self._run_time_range(ctx)
+            if ctx.get("t_floor") is not None:
+                self._status_log_append(f"Part of the recording: t = [{time_range[0]:.0f} .. {time_range[1]:.0f}] us, "
+                                        f"{ctx['N']} time steps")
             if dpg.does_item_exist("det_run_stats"):
                 dpg.set_value("det_run_stats", "-")
         except Exception as e:
@@ -997,8 +1014,9 @@ class DetectionTab:
             try:
                 with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
                     out = self.engine.run(ctx)
+                    self._set_time_range(out, time_range)
                     self.last_result = out
-        
+
                 self._log_queue.put("[DETECTION] Done.")
                 pt = self.preprocessing_tab
                 events = pt.filtered_events if pt.filtered_events is not None else pt.raw_events
@@ -1044,6 +1062,14 @@ class DetectionTab:
         self._run_thread = threading.Thread(target=worker, daemon=True)
         self._run_thread.start()
     
+    @staticmethod
+    def _set_time_range(out, time_range) -> None:
+        """Part of the recording the results cover (the timeline shows it; kept in saved results)."""
+        try:
+            out.time_range = tuple(float(t) for t in time_range)
+        except Exception:
+            pass
+
     def _on_N_change(self, sender, app_data, user_data):
         self._n_user_set = True
         self.params["N"] = int(app_data)
@@ -1073,6 +1099,10 @@ class DetectionTab:
 
         if events is None:
             return 1
+
+        r = pt.timeline.range_steps() if hasattr(pt, "timeline") else None
+        if r is not None:  # part of the recording set on the timeline
+            return int(r[2])
 
         _, _, T, _ = events
 
@@ -1164,7 +1194,8 @@ class DetectionTab:
                 if Ttmp is None or getattr(Ttmp, "size", len(Ttmp)) == 0:
                     continue
                 # cheap signature: this handler runs on every rendered frame while the tab is shown
-                sig = (name, id(Ttmp), int(len(Ttmp)), float(pt.params.get("accumulation_time_ms", 0)))
+                sig = (name, id(Ttmp), int(len(Ttmp)), float(pt.params.get("accumulation_time_ms", 0)),
+                       pt.timeline.start, pt.timeline.end)
                 T = Ttmp
                 break
             except Exception:
@@ -1188,9 +1219,7 @@ class DetectionTab:
         if acc_us <= 0:
             return
     
-        tmax = float(T[-1])   # preprocessing keeps the events time sorted
-        tmin = float(T[0])
-        new_N = max(1, int(math.ceil((tmax-tmin) / acc_us)))
+        new_N = self._compute_default_N()
 
         self.params["N"] = new_N
         if dpg.does_item_exist("det_input_matching_N"):
@@ -1205,11 +1234,11 @@ class DetectionTab:
         return int(np.count_nonzero(mask))
     
     
-    def _count_events_in_steps(self, T_global, dt_us: float, N: int) -> int:
+    def _count_events_in_steps(self, T_global, dt_us: float, N: int, t_start=None) -> int:
         if T_global is None or len(T_global) == 0:
             return 0
         T = np.asarray(T_global, dtype=float)
-        t_min = float(np.min(T))
+        t_min = float(np.min(T)) if t_start is None else max(float(T[0]), float(t_start))
         t_max = t_min + float(N) * float(dt_us)
         mask = (T >= t_min) & (T <= t_max)
         return int(np.count_nonzero(mask))
@@ -1251,7 +1280,7 @@ class DetectionTab:
             n_total = self._count_events_in_test_step(X_global, Y_global, T_global, dt_us, ctx.get("t_start"))
         else:
             N = int(ctx.get("N", 1))
-            n_total = self._count_events_in_steps(T_global, dt_us, N)
+            n_total = self._count_events_in_steps(T_global, dt_us, N, ctx.get("t_start"))
 
         ratio = (sum_clustered_events / n_total) if n_total > 0 else 0.0
 
