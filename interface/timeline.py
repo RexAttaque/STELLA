@@ -9,6 +9,14 @@ marks.
 
 Mouse: click or drag on the bar. Keys (not while typing in a field): Left / Right one step (Shift: 10),
 Home / End, Space play / pause, I / O set the start / end of the range at the displayed step.
+
+Playback always draws PLAYBACK_FPS frames per second; the speed, in Hz, divides how fast recording time goes
+(1 Hz: real time, 10000 Hz: one second of recording plays in 10000 s): each drawn frame, the shown window slides
+by the real time since the previous one / speed (a fraction of a step when slow; the speed holds when a page
+draws slower than PLAYBACK_FPS), and snaps back to the nearest step on pause.
+
+Each page shows the bar and its status log in a tile of their own under the views (build_tile), so they stay
+visible whichever view sub-tab is open.
 """
 from __future__ import annotations
 
@@ -24,7 +32,11 @@ BAR_HEIGHT = 30
 _PAD = 6           # free space left and right of the bar (the handle stays visible at both ends)
 _BAR_Y = (9, 23)   # top and bottom of the coloured bar
 SPEED_TAG = "timeline_speed"
-SPEED_DEFAULT = 30
+SPEED_DEFAULT = 20.0                # Hz: recording time / 20 (2 ms steps: 25 steps per second)
+SPEED_MIN, SPEED_MAX = 1e-3, 1e9
+PLAYBACK_FPS = 24
+TILE_HEIGHT = 155                   # tile of the bar and the status log, under the views
+VIEW_HEIGHT = 950 - 16 - TILE_HEIGHT - 6  # the views above it, in the 950 px high visualization column
 
 COL_BG = (45, 45, 45, 255)
 COL_DATA = (60, 120, 220, 255)
@@ -72,6 +84,7 @@ class Timeline:
         self.end: Optional[float] = None    # None: to the end
         self.playing = False
         self._last_tick = 0.0
+        self._due = 0.0                     # time the next playback frame is due
         self._drag: Optional[str] = None    # bar being dragged
         self._bars: list[str] = []
         self._range_texts: list[str] = []
@@ -125,10 +138,13 @@ class Timeline:
             return
         t0, step, K = g
         k = min(max(int(k), 0), K - 1)
-        t = t0 + k * step
+        self.seek_time(t0 + k * step)
+
+    def seek_time(self, t: float) -> None:
+        """Shows the window (t, t + step] on every page (t need not be on the step grid: playback)."""
         if self.pre.display_t0 is not None and float(self.pre.display_t0) == t:
             return
-        self.pre.display_t0 = t
+        self.pre.display_t0 = float(t)
         self.pre.update_pseudoframe_from_data()
 
     def step(self, n: int) -> None:
@@ -256,12 +272,18 @@ class Timeline:
                 dpg.set_value(tag, text)
 
     # ------------------------------------------------------------------ widgets
-    def build(self, name: str, time_info_tag: str = "") -> None:
-        """The bar and its controls, in the current container (one per page)."""
+    def build_tile(self, name: str, time_info_tag: str, log_tag: str, status_tag: str = "") -> None:
+        """The tile under the views of a page, in the current container: the bar, its controls and the page's
+        status log (`log_tag`, a read-only multiline text). `status_tag`: the pseudo-frame status text."""
+        with dpg.child_window(height=TILE_HEIGHT, border=True, no_scrollbar=True, tag=f"timeline_tile_{name}"):
+            self._build_bar(name, time_info_tag, status_tag)
+            dpg.add_input_text(tag=log_tag, multiline=True, readonly=True, width=-1, height=-1)
+
+    def _build_bar(self, name: str, time_info_tag: str, status_tag: str) -> None:
         self._install_handlers()
         if not dpg.does_item_exist(SPEED_TAG):
             with dpg.value_registry():
-                dpg.add_int_value(tag=SPEED_TAG, default_value=SPEED_DEFAULT)
+                dpg.add_double_value(tag=SPEED_TAG, default_value=SPEED_DEFAULT)
         bar = f"timeline_bar_{name}"
         width = self.pre.display_size()[0]
         dpg.add_drawlist(width=width, height=BAR_HEIGHT, tag=bar)
@@ -274,6 +296,8 @@ class Timeline:
             dpg.add_text("detected", color=COL_DETECTION[:3])
             dpg.add_text("tracked", color=COL_TRACKING[:3])
             dpg.add_text("processing range", color=COL_RANGE[:3])
+            if status_tag:
+                dpg.add_text("", tag=status_tag, color=(150, 150, 150))
             tag = f"timeline_progress_{name}"
             dpg.add_text("", tag=tag, color=COL_PROGRESS_TEXT)
             self._progress_texts.append(tag)
@@ -281,14 +305,17 @@ class Timeline:
             dpg.add_button(label="Set start (I)", callback=self.set_start)
             dpg.add_button(label="Set end (O)", callback=self.set_end)
             dpg.add_button(label="Clear marks", callback=self.clear_range)
+            speed = dpg.add_input_double(label="Hz", source=SPEED_TAG, width=90, min_value=SPEED_MIN,
+                                         max_value=SPEED_MAX, min_clamped=True, max_clamped=True, step=0,
+                                         format="%.6g", tag=f"timeline_speed_{name}")
+            with dpg.tooltip(speed):
+                dpg.add_text(f"Playback speed: recording time divided by this value (1 Hz: real time, 10000 Hz:\n"
+                             f"1 s of recording lasts 10000 s). Always drawn at {PLAYBACK_FPS} fps.\n\n"
+                             "Space: play / pause   Left / Right: one step (Shift: 10)   Home / End\n"
+                             "I / O: set start / end   click or drag the bar")
             tag = f"timeline_range_{name}"
             dpg.add_text(self.range_text(), tag=tag)
             self._range_texts.append(tag)
-        with dpg.group(horizontal=True):
-            dpg.add_input_int(label="steps/s", source=SPEED_TAG, width=90, min_value=1, max_value=240,
-                              min_clamped=True, max_clamped=True, step=0, tag=f"timeline_speed_{name}")
-            dpg.add_text("Space: play / pause   Left / Right: one step (Shift: 10)   Home / End   "
-                         "click or drag the bar", color=(150, 150, 150))
 
     def _resize(self, bar: str, width: int) -> None:
         if dpg.does_item_exist(bar):
@@ -330,8 +357,9 @@ class Timeline:
             for xx in (xs, xe):
                 dpg.draw_line((xx, 2), (xx, y1 + 2), color=COL_RANGE, thickness=2, parent=bar)
         k = self.index(g)
-        if k is not None:
-            a, b = x(t0 + k * step), x(t0 + (k + 1) * step)
+        if k is not None:  # the window shown (between two steps while playing)
+            ts = float(self.pre.display_t0) if self.pre.display_t0 is not None else t0
+            a, b = x(ts), x(ts + step)
             if b - a < 4:
                 a, b = (a + b) / 2 - 2, (a + b) / 2 + 2
             dpg.draw_rectangle((a, 0), (b, BAR_HEIGHT - 1), fill=COL_HANDLE, color=(20, 20, 20, 255), rounding=2,
@@ -453,11 +481,29 @@ class Timeline:
         if g is None:
             self.playing = False
             return
-        self.playing = not self.playing
         if self.playing:
-            if self.index(g) >= g[2] - 1:  # at the end: from the start again
-                self.seek(0)
-            self._last_tick = time.perf_counter()
+            self.pause()
+            return
+        self.playing = True
+        if self.index(g) >= g[2] - 1:  # at the end: from the start again
+            self.seek(0)
+        self._last_tick = time.perf_counter()
+        self._due = self._last_tick + 1.0 / PLAYBACK_FPS
+
+    def pause(self) -> None:
+        """Stops playback on the nearest step (arrows, marks and runs work on steps)."""
+        self.playing = False
+        k = self.index()
+        if k is not None:
+            self.seek(k)
+
+    def speed(self) -> float:
+        """Playback speed in Hz: recording time advances at real time / speed."""
+        try:
+            v = float(dpg.get_value(SPEED_TAG)) if dpg.does_item_exist(SPEED_TAG) else SPEED_DEFAULT
+        except (TypeError, ValueError):
+            v = SPEED_DEFAULT
+        return min(max(v, SPEED_MIN), SPEED_MAX) if v > 0 else SPEED_DEFAULT
 
     def tick(self) -> None:
         """Every rendered frame: dragging, playback, bar redraw."""
@@ -468,15 +514,28 @@ class Timeline:
                 self._drag = None
         if self.playing:
             now = time.perf_counter()
-            speed = max(1, int(dpg.get_value(SPEED_TAG) or SPEED_DEFAULT)) if dpg.does_item_exist(SPEED_TAG) \
-                else SPEED_DEFAULT
-            if now - self._last_tick >= 1.0 / speed:
-                # at most one step per drawn frame: every step is shown, slower than asked if drawing is slow
-                self._last_tick = max(self._last_tick + 1.0 / speed, now - 1.0 / speed)
+            frame = 1.0 / PLAYBACK_FPS
+            # playback frames are due on a PLAYBACK_FPS grid; one is drawn on the first rendered frame within half
+            # a screen refresh of its due time (on a 60 Hz screen: 2 and 3 refreshes apart, 24 per second)
+            if now >= self._due - 0.008:
+                self._due += frame
+                if self._due < now:  # drawing slower than PLAYBACK_FPS: no burst of frames to catch up
+                    self._due = now + frame
+                # recording time advances by the real time since the last playback frame / speed (the speed stays
+                # right when a page draws slower)
+                elapsed = min(now - self._last_tick, 0.25)  # a stall (dialog, heavy redraw) does not jump ahead
+                self._last_tick = now
                 g = self.grid()
-                k = self.index(g)
-                if g is None or k >= g[2] - 1:
+                if g is None:
                     self.playing = False
                 else:
-                    self.seek(k + 1)
+                    t0, step, K = g
+                    last = t0 + (K - 1) * step
+                    cur = float(self.pre.display_t0) if self.pre.display_t0 is not None else t0
+                    t = cur + 1e6 * elapsed / self.speed()  # us of recording
+                    if t >= last:
+                        self.playing = False
+                        self.seek(K - 1)
+                    else:
+                        self.seek_time(t)
         self.refresh()

@@ -4,6 +4,8 @@ from copy import deepcopy
 from typing import Any, Optional, TYPE_CHECKING
 
 import dearpygui.dearpygui as dpg
+
+from interface.timeline import VIEW_HEIGHT
 from interface.view_zoom import SharedZoom, overlay_transform
 import numpy as np
 import pandas as pd
@@ -101,9 +103,20 @@ class ValidationTab:
                     self._build_data_panel()
 
                 with dpg.child_window(label="Visualization", width=1920 - 550, height=950):
-                    dpg.add_text("VISUALIZATION", color=(100, 200, 255))
-                    dpg.add_separator()
-                    self._build_validation_pseudoframe_panel()
+                    with dpg.child_window(height=VIEW_HEIGHT, border=False):  # the view
+                        self._build_validation_pseudoframe_panel()
+                    # bar and status log: a tile of their own under the view
+                    if self.preprocessing_tab is not None:
+                        self.preprocessing_tab.timeline.build_tile(
+                            "validation", time_info_tag=self._pf_time_info_tag, log_tag="vali_status_log_text",
+                            status_tag=self._pf_status_tag)
+                        self.preprocessing_tab.register_pseudoframe_mirror(status_tag=self._pf_status_tag,
+                                                                           time_info_tag=self._pf_time_info_tag)
+                    else:
+                        dpg.add_text("", tag=self._pf_time_info_tag)
+                        dpg.add_text("", tag=self._pf_status_tag)
+                        dpg.add_input_text(tag="vali_status_log_text", multiline=True, readonly=True, width=-1,
+                                           height=-1)
                 
         self._status_log_append("Ready.")
         
@@ -325,19 +338,6 @@ class ValidationTab:
         if self.preprocessing_tab is not None:
             self.preprocessing_tab.register_geometry_listener(self._on_geometry)
 
-        dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._pf_status_tag, wrap=1200)
-
-        if self.preprocessing_tab is not None:
-            self.preprocessing_tab.timeline.build("validation", time_info_tag=self._pf_time_info_tag)
-        else:
-            dpg.add_text("", tag=self._pf_time_info_tag, wrap=900)
-
-        if self.preprocessing_tab is not None:
-            self.preprocessing_tab.register_pseudoframe_mirror(
-                status_tag=self._pf_status_tag,
-                time_info_tag=self._pf_time_info_tag,
-            )
-
         dpg.add_input_float(
             label="Track window factor (× accumulation time)",
             default_value=float(self.params.get("track_timefactor", 2.0)),
@@ -348,17 +348,6 @@ class ValidationTab:
             callback=lambda s, a, u: self._on_track_timefactor_change(float(a)),
         )
         
-        dpg.add_separator()
-        
-        dpg.add_text("Status Log", color=(200, 200, 100))
-        with dpg.child_window(label="Status Log", height=90, width=720):
-            dpg.add_input_text(
-                tag="vali_status_log_text",
-                multiline=True,
-                readonly=True,
-                width=695,
-                height=75,
-            )
         
     def _status_log_append(self, line: str) -> None:
         if not dpg.does_item_exist("vali_status_log_text"):

@@ -5,7 +5,6 @@ from matplotlib import colormaps
 import matplotlib.pyplot as plt
 from utils.paths import default_files_dir
 from utils.plots import figure_to_rgba_flat
-from utils.track_index import tracks_in_window
 from utils.packed_tracks import PackedTracks
 
 
@@ -28,6 +27,7 @@ if str(ROOT) not in sys.path:
 from utils.tracking_engine import TrackingEngine, TrackingCancelled, TrackingOutputs
 from utils import tracking_chunks
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
+from interface.timeline import VIEW_HEIGHT
 from config.settings import STORE
 from interface.settings_ui import add_setting_field
 
@@ -156,16 +156,18 @@ class TrackingTab:
                     self._build_data_panel()
 
                 with dpg.child_window(label="Visualization", width=1920 - 550, height=950):
-                    dpg.add_text("VISUALIZATION", color=(100, 200, 255))
-                    dpg.add_separator()
-
-                    with dpg.tab_bar(tag="track_vis_tabbar"):
-                        with dpg.tab(label="Clusters"):
-                            self._build_cluster_plot_panel()
-                        with dpg.tab(label="Pseudo-frame"):
-                            self._build_tracking_pseudoframe_panel()
-                        with dpg.tab(label="Track duration", tag="track_vis_tab_duration_hist"):
-                            self._build_track_duration_hist_panel()
+                    with dpg.child_window(height=VIEW_HEIGHT, border=False):  # the views
+                        # (a tab bar first in a child window gets a stretched first tab: DearPyGui quirk)
+                        dpg.add_spacer(height=1)
+                        with dpg.tab_bar(tag="track_vis_tabbar"):
+                            with dpg.tab(label="Clusters"):
+                                self._build_cluster_plot_panel()
+                            with dpg.tab(label="Pseudo-frame"):
+                                self._build_tracking_pseudoframe_panel()
+                            with dpg.tab(label="Track duration", tag="track_vis_tab_duration_hist"):
+                                self._build_track_duration_hist_panel()
+                    # bar and status log: a tile of their own, shown whichever view is open
+                    self._build_timeline_tile()
         self._status_log_append("Ready.")
         
     def _ensure_textures(self) -> None:
@@ -481,18 +483,17 @@ class TrackingTab:
     
         self._refresh_cluster_order_if_needed(force=True)
         self._update_cluster_plot()
-    
-        dpg.add_separator()
-    
-        dpg.add_text("Status Log", color=(200, 200, 100))
-        with dpg.child_window(label="Status Log", height=90, width=720):
-            dpg.add_input_text(
-                tag="track_status_log_text",
-                multiline=True,
-                readonly=True,
-                width=695,
-                height=75,
-            )
+
+    def _build_timeline_tile(self) -> None:
+        if self.preprocessing_tab is None:
+            dpg.add_text("", tag=self._pf_time_info_tag)
+            dpg.add_text("", tag=self._pf_status_tag)
+            dpg.add_input_text(tag="track_status_log_text", multiline=True, readonly=True, width=-1, height=-1)
+            return
+        self.preprocessing_tab.timeline.build_tile("tracking", time_info_tag=self._pf_time_info_tag,
+                                                   log_tag="track_status_log_text", status_tag=self._pf_status_tag)
+        self.preprocessing_tab.register_pseudoframe_mirror(status_tag=self._pf_status_tag,
+                                                           time_info_tag=self._pf_time_info_tag)
 
     def _build_tracking_pseudoframe_panel(self) -> None:
         pseudo_texture = (
@@ -516,38 +517,26 @@ class TrackingTab:
         if self.preprocessing_tab is not None:
             self.preprocessing_tab.register_geometry_listener(self._on_geometry)
     
-        dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._pf_status_tag, wrap=730)
-    
-        if self.preprocessing_tab is not None:
-            self.preprocessing_tab.timeline.build("tracking", time_info_tag=self._pf_time_info_tag)
-        else:
-            dpg.add_text("", tag=self._pf_time_info_tag, wrap=600)
-    
-        if self.preprocessing_tab is not None:
-            self.preprocessing_tab.register_pseudoframe_mirror(
-                status_tag=self._pf_status_tag,
-                time_info_tag=self._pf_time_info_tag,
+        with dpg.group(horizontal=True):  # one row: the view fits above the timeline tile
+            dpg.add_input_float(
+                label="Track window factor (× accumulation time)",
+                default_value=float(self.params.get("track_timefactor", 2.0)),
+                width=200,
+                format="%.2f",
+                on_enter=True,
+                tag=self._pf_timefactor_input_tag,
+                callback=lambda s, a, u: self._on_track_timefactor_change(float(a)),
             )
-            
-        dpg.add_input_float(
-            label="Track window factor (× accumulation time)",
-            default_value=float(self.params.get("track_timefactor", 2.0)),
-            width=200,
-            format="%.2f",
-            on_enter=True,
-            tag=self._pf_timefactor_input_tag,
-            callback=lambda s, a, u: self._on_track_timefactor_change(float(a)),
-        )
         
-        dpg.add_input_float(
-            label="Max velocity (plotting)",
-            default_value=float(self.params.get("track_vmax", 0.0)),
-            width=200,
-            format="%.6f",
-            on_enter=True,
-            tag=self._pf_vmax_input_tag,
-            callback=lambda s, a, u: self._on_track_vmax_change(float(a)),
-        )
+            dpg.add_input_float(
+                label="Max velocity (plotting)",
+                default_value=float(self.params.get("track_vmax", 0.0)),
+                width=200,
+                format="%.6f",
+                on_enter=True,
+                tag=self._pf_vmax_input_tag,
+                callback=lambda s, a, u: self._on_track_vmax_change(float(a)),
+            )
     
     def _build_track_duration_hist_panel(self):
         with dpg.child_window(
@@ -1410,81 +1399,81 @@ class TrackingTab:
         T_min = float(t0) - (factor-1.0) * acc_us
         T_max = float(t0) + acc_us
         # only the tracks overlapping the window (time ranges cached per result)
-        shown = tracks_in_window(t_plot, T_min, T_max, n_tracks)
-        vmins = []
-        vmaxs = []
-        for i in shown:
-            t = np.asarray(t_plot[i], dtype=float).ravel()
-            x = np.asarray(x_plot[i], dtype=float).ravel() - 1
-            y = np.asarray(y_plot[i], dtype=float).ravel() - 1
-            xv = np.asarray(x_plotv[i], dtype=float).ravel()
-            yv = np.asarray(y_plotv[i], dtype=float).ravel()
-    
-            n = min(len(t), len(x), len(y), len(xv), len(yv))
-            if n < 2:
-                continue
-            t, x, y, xv, yv = t[:n], x[:n], y[:n], xv[:n], yv[:n]
-    
-            m = np.isfinite(t) & np.isfinite(x) & np.isfinite(y) & np.isfinite(xv) & np.isfinite(yv)
-            m &= (t >= T_min) & (t <= T_max)
-            if np.count_nonzero(m) < 2:
-                continue
-    
-            spd = np.sqrt(xv[m] ** 2 + yv[m] ** 2)
-            if spd.size:
-                vmins.append(float(np.min(spd)))
-                vmaxs.append(float(np.max(spd)))
-    
-        if not vmins:
+        # the points of all tracks in the window at once (drawn on every playback frame: no loop over tracks)
+        pts = self._track_points(out, (x_plot, y_plot, t_plot, x_plotv, y_plotv), n_tracks)
+        lo = int(np.searchsorted(pts["t"], T_min, side="left"))  # t in [T_min, T_max]
+        hi = int(np.searchsorted(pts["t"], T_max, side="right"))
+        if hi - lo < 2:
             return
-    
-        vmin = min(vmins)
+        tid, pos = pts["tid"][lo:hi], pts["pos"][lo:hi]
+        order = np.lexsort((pos, tid))  # track by track, in track order
+        tid = tid[order]
+        x, y, spd = pts["x"][lo:hi][order], pts["y"][lo:hi][order], pts["spd"][lo:hi][order]
+        same = tid[1:] == tid[:-1]
+        seg = np.flatnonzero(same)  # segment k: point k to k + 1 of the same track
+        if seg.size == 0:
+            return
+        in_seg = np.zeros(tid.size, bool)  # points of the tracks with 2 points or more in the window
+        in_seg[seg] = True
+        in_seg[seg + 1] = True
+        vmax_data = float(np.max(spd[in_seg]))
+
         vmin = 0.0
-        vmax_data = max(vmaxs)
         vmax_user = float(self.params.get("track_vmax", 0.0))
         vmax = vmax_user if vmax_user > 0.0 else vmax_data
 
         if vmax <= vmin:
             vmax = vmin + 1e-12
-    
-        cmap = colormaps["viridis"]  # cm.get_cmap was removed in matplotlib 3.9
-    
-        def _speed_to_color(s: float):
-            a = (s - vmin) / (vmax - vmin)
-            a = 0.0 if a < 0.0 else 1.0 if a > 1.0 else a
-            r, g, b, _ = cmap(a)
-            return (int(r * 255), int(g * 255), int(b * 255), 255)
 
-        for i in shown:
+        cmap = colormaps["viridis"]  # cm.get_cmap was removed in matplotlib 3.9
+        # segment coloured by the speed at its first point (int(r * 255) as before)
+        a = np.clip((spd[seg] - vmin) / (vmax - vmin), 0.0, 1.0)
+        rgb = (cmap(a)[:, :3] * 255).astype(np.int64)
+        cols = np.column_stack((rgb, np.full(seg.size, 255))).tolist()
+        p1 = np.column_stack((x[seg], y[seg])).tolist()
+        p2 = np.column_stack((x[seg + 1], y[seg + 1])).tolist()
+        node = self._pf_tracks_node_tag
+        for a1, a2, c in zip(p1, p2, cols):
+            dpg.draw_line(p1=a1, p2=a2, color=c, thickness=2.0, parent=node)
+
+    def _track_points(self, out, arrays, n_tracks):
+        """All finite points of the first n_tracks tracks as flat arrays sorted by time (cached per result):
+        track index, index in the track, t, x - 1, y - 1, speed."""
+        key = (id(out), n_tracks)
+        cache = getattr(self, "_track_points_cache", None)
+        if cache is not None and cache[0] == key and cache[1] is out:
+            return cache[2]
+        x_plot, y_plot, t_plot, x_plotv, y_plotv = arrays
+        parts = {k: [] for k in ("tid", "pos", "t", "x", "y", "spd")}
+        for i in range(n_tracks):
             t = np.asarray(t_plot[i], dtype=float).ravel()
-            x = np.asarray(x_plot[i], dtype=float).ravel() - 1
-            y = np.asarray(y_plot[i], dtype=float).ravel() - 1
+            x = np.asarray(x_plot[i], dtype=float).ravel()
+            y = np.asarray(y_plot[i], dtype=float).ravel()
             xv = np.asarray(x_plotv[i], dtype=float).ravel()
             yv = np.asarray(y_plotv[i], dtype=float).ravel()
-
             n = min(len(t), len(x), len(y), len(xv), len(yv))
             if n < 2:
                 continue
             t, x, y, xv, yv = t[:n], x[:n], y[:n], xv[:n], yv[:n]
-
             m = np.isfinite(t) & np.isfinite(x) & np.isfinite(y) & np.isfinite(xv) & np.isfinite(yv)
-            m &= (t >= T_min) & (t <= T_max)
-            if np.count_nonzero(m) < 2:
+            k = np.flatnonzero(m)
+            if k.size < 2:
                 continue
+            parts["tid"].append(np.full(k.size, i, np.int64))
+            parts["pos"].append(k)
+            parts["t"].append(t[k])
+            parts["x"].append(x[k] - 1)
+            parts["y"].append(y[k] - 1)
+            parts["spd"].append(np.sqrt(xv[k] ** 2 + yv[k] ** 2))
+        if parts["t"]:
+            pts = {k: np.concatenate(v) for k, v in parts.items()}
+        else:
+            pts = {k: np.zeros(0, np.int64 if k in ("tid", "pos") else float) for k in parts}
+        order = np.argsort(pts["t"], kind="stable")
+        pts = {k: v[order] for k, v in pts.items()}
+        self._track_points_cache = (key, out, pts)
+        return pts
 
-            t = t[m]; x = x[m]; y = y[m]; xv = xv[m]; yv = yv[m]
-            spd = np.sqrt(xv ** 2 + yv ** 2)
-
-            for k in range(len(x) - 1):
-                col = _speed_to_color(float(spd[k]))
-                dpg.draw_line(
-                    p1=[float(x[k]), float(y[k])],
-                    p2=[float(x[k + 1]), float(y[k + 1])],
-                    color=col,
-                    thickness=2.0,
-                    parent=self._pf_tracks_node_tag,
-                )
-                
     def _on_track_vmax_change(self, v: float) -> None:
         try:
             v = float(v)

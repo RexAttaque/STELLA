@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 from utils.detection_engine import DetectionEngine
 
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
+from interface.timeline import VIEW_HEIGHT
 from config.settings import STORE
 from interface.settings_ui import add_setting_field
 
@@ -149,17 +150,19 @@ class DetectionTab:
                     self._build_data_panel()
 
                 with dpg.child_window(label="Visualization", width=1920 - 550, height=950):
-                    dpg.add_text("VISUALIZATION", color=(100, 200, 255))
-                    dpg.add_separator()
+                    with dpg.child_window(height=VIEW_HEIGHT, border=False):  # the views
+                        # (a tab bar first in a child window gets a stretched first tab: DearPyGui quirk)
+                        dpg.add_spacer(height=1)
+                        with dpg.tab_bar(tag="det_vis_tabbar"):
+                            with dpg.tab(label="Pseudo-frame", tag="det_vis_tab_detection"):
+                                self._build_detection_plot_panel()
 
-                    with dpg.tab_bar(tag="det_vis_tabbar"):
-                        with dpg.tab(label="Pseudo-frame", tag="det_vis_tab_detection"):
-                            self._build_detection_plot_panel()
-                            
-                        with dpg.tab(label="Event cluster", tag="det_vis_tab_newplot"):
-                            self._build_new_plot_panel()
-                        with dpg.tab(label="Cluster duration", tag="det_vis_tab_duration_hist"):
-                            self._build_duration_hist_panel()
+                            with dpg.tab(label="Event cluster", tag="det_vis_tab_newplot"):
+                                self._build_new_plot_panel()
+                            with dpg.tab(label="Cluster duration", tag="det_vis_tab_duration_hist"):
+                                self._build_duration_hist_panel()
+                    # bar and status log: a tile of their own, shown whichever view is open
+                    self._build_timeline_tile()
                     
         handler_tag = "det_tab_handler_registry"
 
@@ -709,30 +712,18 @@ class DetectionTab:
             )
         self._view_zoom.register("det_pf_drawlist", lambda uv_min, uv_max: dpg.configure_item(
             "det_pf_drawimage", uv_min=uv_min, uv_max=uv_max))
-        dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._status_tag, wrap=730)
 
-        if self.preprocessing_tab is not None:
-            self.preprocessing_tab.timeline.build("detection", time_info_tag=self._time_info_tag)
-        else:
-            dpg.add_text("", tag=self._time_info_tag, wrap=600)
+    def _build_timeline_tile(self):
+        if self.preprocessing_tab is None:
+            dpg.add_text("", tag=self._time_info_tag)
+            dpg.add_text("", tag=self._status_tag)
+            dpg.add_input_text(tag="det_status_log_text", multiline=True, readonly=True, width=-1, height=-1)
+            return
+        self.preprocessing_tab.timeline.build_tile("detection", time_info_tag=self._time_info_tag,
+                                                   log_tag="det_status_log_text", status_tag=self._status_tag)
+        self.preprocessing_tab.register_pseudoframe_mirror(status_tag=self._status_tag,
+                                                           time_info_tag=self._time_info_tag)
 
-        if self.preprocessing_tab is not None:
-            self.preprocessing_tab.register_pseudoframe_mirror(
-                status_tag=self._status_tag,
-                time_info_tag=self._time_info_tag,
-            )
-        
-        dpg.add_separator()
-        dpg.add_text("Status Log", color=(200, 200, 100))
-        with dpg.child_window(label="Status Log", height=90, width=720):
-            dpg.add_input_text(
-                tag="det_status_log_text",
-                multiline=True,
-                readonly=True,
-                width=695,
-                height=75,
-            )
-    
     def _build_new_plot_panel(self):
         if not dpg.does_item_exist("det_cluster_plot_texture"):
             with dpg.texture_registry(show=False):
@@ -1184,7 +1175,15 @@ class DetectionTab:
         events = pt.filtered_events if pt.filtered_events is not None else pt.raw_events
         T = events[2] if events is not None else None
         return (id(T), 0 if T is None else len(T), pt.display_t0,
-                float(pt.params.get("accumulation_time_ms", 0)), id(self.last_result))
+                float(pt.params.get("accumulation_time_ms", 0)), id(self.last_result), self._cluster_view_shown())
+
+    @staticmethod
+    def _cluster_view_shown() -> bool:
+        """The "Event cluster" view is the open sub-tab (its picture is only drawn then: playback)."""
+        try:
+            return dpg.get_value("det_vis_tabbar") == dpg.get_alias_id("det_vis_tab_newplot")
+        except Exception:
+            return True
             
             
     def refresh_defaults_from_preprocessing(self):
@@ -1769,6 +1768,17 @@ class DetectionTab:
         except Exception as e:
             self._status_log_append(f"[DETECTION] Refresh pseudoframe failed: {e}")
     
+        if self._cluster_view_shown():  # hidden: drawn when opened (the signature changes then)
+            self._refresh_cluster_view()
+
+        try:
+            self._update_duration_histogram()
+        except Exception as e:
+            self._status_log_append(f"[DETECTION] Refresh histogram failed: {e}")
+
+        self._log_clusters_in_frame()
+
+    def _refresh_cluster_view(self):
         try:
             out = getattr(self, "last_result", None)
     
@@ -1808,18 +1818,13 @@ class DetectionTab:
         except Exception as e:
             self._status_log_append(f"[DETECTION] Refresh cluster plot failed: {e}")
 
-        try:
-            self._update_duration_histogram()
-        except Exception as e:
-            self._status_log_append(f"[DETECTION] Refresh histogram failed: {e}")
-    
-        self._log_clusters_in_frame()
-
     def _log_clusters_in_frame(self):
         # tells why the views can be empty: they only show clusters of the displayed frame
         out = getattr(self, "last_result", None)
         pt = self.preprocessing_tab
         if out is None or pt is None or pt.display_t0 is None or not hasattr(out, "t_clust"):
+            return
+        if pt.timeline.playing:  # not on every playback frame
             return
         t0 = float(pt.display_t0)
         t1 = t0 + float(pt.params.get("accumulation_time_ms", 2.0)) * 1000.0

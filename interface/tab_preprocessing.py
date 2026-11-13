@@ -16,7 +16,7 @@ from config.constants import (
 from utils.paths import default_files_dir
 from utils.masks import MASK_MODES, Mask, keep_map, load_masks, save_masks
 from interface.mask_editor import PolygonMaskEditor
-from interface.timeline import Timeline
+from interface.timeline import VIEW_HEIGHT, Timeline
 from utils.dataloader import build_preview_and_stats, load_data_file
 from utils.helpers import EventDataHelper
 from utils.plots import (
@@ -94,9 +94,11 @@ class PreprocessingTab:
                 with dpg.child_window(label="Data Management", width=500, height=950):
                     self._build_data_panel()
                 with dpg.child_window(label="Visualization", width=1920-550, height=950):
-                    dpg.add_text("VISUALIZATION", color=(100, 200, 255))
-                    dpg.add_separator()
-                    self._build_preprocessing_parameters_panel()
+                    with dpg.child_window(height=VIEW_HEIGHT, border=False):  # the view
+                        self._build_preprocessing_parameters_panel()
+                    # bar and status log: a tile of their own under the view
+                    self.timeline.build_tile("preprocessing", time_info_tag="pseudoframe_time_info",
+                                             log_tag="status_log_text", status_tag="preprocessing_pseudoframe_status")
         self.reset_pseudoframe_visualization()
 
     def register_pseudoframe_mirror(self, *, status_tag: str, time_info_tag: str) -> None:
@@ -304,14 +306,6 @@ class PreprocessingTab:
             on_change=self._on_masks_changed, on_message=self._mask_message, pending=self._mask_pending)
         self.view_zoom.register("preprocessing_pf_drawlist", self._apply_view_zoom)
         self.register_geometry_listener(self._on_own_geometry)
-        dpg.add_text("Load data to generate pseudo-frame.", tag="preprocessing_pseudoframe_status", wrap=730)
-        
-        self.timeline.build("preprocessing", time_info_tag="pseudoframe_time_info")
-
-        dpg.add_separator()
-        dpg.add_text("Status Log", color=(200, 200, 100))
-        with dpg.child_window(label="Status Log", height=90, width=720):
-            dpg.add_input_text(tag="status_log_text", multiline=True, readonly=True, width=695, height=75)
 
     # ------------------------------------------------------------------
     # File handling
@@ -776,31 +770,27 @@ class PreprocessingTab:
     def render_pseudoframe_to_texture(self, frame: np.ndarray) -> None:
         if frame is None:
             return
-        frame_array = np.array(frame, dtype=np.float32)
-        frame_array = np.nan_to_num(frame_array, nan=0.0, posinf=0.0, neginf=0.0)
-            
-        if frame_array.ndim == 2:
+        frame_array = np.asarray(frame, dtype=np.float32)
+
+        if frame_array.ndim == 2:  # (every playback frame: kept cheap)
             pseudo_width, pseudo_height = self.pseudoframe_dimensions
             src_height, src_width = frame_array.shape
             if src_height <= 0 or src_width <= 0:
                 return
-        
-            y_indices = np.linspace(0, src_height - 1, pseudo_height).astype(np.int32)
-            x_indices = np.linspace(0, src_width - 1, pseudo_width).astype(np.int32)
-            resized = frame_array[y_indices][:, x_indices]
-
-            cmap = np.array([
-                [30,  37,  52],
-                [64, 124, 198],
-                [220, 226, 238],
-            ], dtype=np.float32) / 255.0
-
-            mask = resized > 0
-            rgba = np.zeros((pseudo_height, pseudo_width, 4), dtype=np.float32)
-            rgba[:, :, :3] = cmap[0]          
-            rgba[mask, :3] = cmap[2]          
-            rgba[:, :, 3] = 1.0               
+            if (src_height, src_width) != (pseudo_height, pseudo_width):
+                y_indices = np.linspace(0, src_height - 1, pseudo_height).astype(np.int32)
+                x_indices = np.linspace(0, src_width - 1, pseudo_width).astype(np.int32)
+                frame_array = frame_array[y_indices][:, x_indices]
+            # background, and the pixels with events (> 0; NaN and +-inf count as no event)
+            base = getattr(self, "_pf_background", None)
+            if base is None or base.shape[:2] != (pseudo_height, pseudo_width):
+                base = self._pf_background = np.empty((pseudo_height, pseudo_width, 4), dtype=np.float32)
+                base[:] = (30 / 255.0, 37 / 255.0, 52 / 255.0, 1.0)
+            rgba = base.copy()
+            rgba[(frame_array > 0) & (frame_array < np.inf)] = np.array(
+                [220 / 255.0, 226 / 255.0, 238 / 255.0, 1.0], dtype=np.float32)
         elif frame_array.ndim == 3 and frame_array.shape[2] in (3, 4):
+            frame_array = np.nan_to_num(frame_array, nan=0.0, posinf=0.0, neginf=0.0)
             pseudo_width, pseudo_height = self.pseudoframe_dimensions
             src_height, src_width = frame_array.shape[:2]
             if src_height <= 0 or src_width <= 0:
@@ -817,7 +807,7 @@ class PreprocessingTab:
         else:
             return
         if dpg.does_item_exist(self.pseudoframe_texture_tag):
-            dpg.set_value(self.pseudoframe_texture_tag, rgba.flatten())
+            dpg.set_value(self.pseudoframe_texture_tag, rgba.reshape(-1))  # fresh array: no copy needed
 
     def update_pseudoframe_from_data(self, message: Optional[str] = None) -> None:
         if not self.filtered_events:
