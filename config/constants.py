@@ -64,6 +64,8 @@ THEME_COLORS: Dict[str, Tuple[int, int, int]] = {
     "frame_bg": (40, 40, 40),
     "window_bg": (30, 30, 30),
     "child_bg": (25, 25, 25),
+    "disabled_bg": (55, 55, 55),
+    "disabled_text": (120, 120, 120),
 }
 
 

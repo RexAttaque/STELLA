@@ -15,6 +15,7 @@ from utils.plots import figure_to_rgba_flat
 from utils.raster import binary_rgba, draw_dots, scalar_rgba
 from utils.packed_tracks import PackedTracks
 from utils import parallel
+from interface.view_zoom import SharedZoom
 from matplotlib.colors import ListedColormap
 from datetime import datetime
 import sys, io, contextlib, threading, queue
@@ -118,10 +119,9 @@ class DetectionTab:
         
         self._last_refresh_signature = None
         self._refresh_in_progress = False
+        self._plotted_signature = None  # what the plots show (see _plot_signature)
         self._overlay_pseudoframe_texture_tag = "detection_pseudoframe_overlay_texture"
-        self._pf_uv_min = [0.0, 0.0]
-        self._pf_uv_max = [1.0, 1.0]
-        self._pf_zoom_enabled = True
+        self._view_zoom = preprocessing_tab.view_zoom if preprocessing_tab is not None else SharedZoom()
         self._last_run_ctx = None
         self.duration_hist_texture_tag = "det_duration_hist_texture"
         self._texture_registry_tag = "det_texture_registry"        
@@ -160,9 +160,6 @@ class DetectionTab:
                 dpg.add_item_activated_handler(callback=self._on_tab_visible)
     
         dpg.bind_item_handler_registry(parent, handler_tag)
-        if not dpg.does_item_exist("det_handler_registry"):
-            with dpg.handler_registry(tag="det_handler_registry"):
-                dpg.add_mouse_wheel_handler(callback=self._on_pf_mouse_wheel)
                 
         self._status_log_append("Ready.")
 
@@ -433,12 +430,6 @@ class DetectionTab:
                 callback=lambda: self._on_clear_results("test"),
                 tag="det_button_clear_test_results",
             )
-            dpg.add_button(
-                label="Refresh plots",
-                width=200,
-                callback=self._on_refresh_plots,
-                tag="det_button_refresh_plots_test",
-            )
 
         dpg.add_separator()
         dpg.add_text("Matching", color=(200, 200, 100))
@@ -566,12 +557,6 @@ class DetectionTab:
                 callback=lambda: self._on_clear_results("run"),
                 tag="det_button_clear_run_results",
             )
-            dpg.add_button(
-                label="Refresh plots",
-                width=200,
-                callback=self._on_refresh_plots,
-                tag="det_button_refresh_plots_run",
-            )
         
         dpg.add_separator()
         dpg.add_text("EXPORT / IMPORT RESULTS", color=(100, 200, 255))
@@ -609,7 +594,6 @@ class DetectionTab:
                 on_enter=True,
             )
             dpg.add_button(label="Browse", callback=self.browse_det_load_results_file, width=80)
-        dpg.add_button(label="Load results", callback=self.load_detection_results, width=120)
         dpg.add_text("", tag="det_load_results_status", color=(100, 255, 100), wrap=430)
         
         if not dpg.does_item_exist("det_save_results_file_dialog"):
@@ -665,10 +649,10 @@ class DetectionTab:
                 pseudo_texture,
                 pmin=[0, 0],
                 pmax=[w, h],
-                uv_min=self._pf_uv_min,
-                uv_max=self._pf_uv_max,
                 tag="det_pf_drawimage",
             )
+        self._view_zoom.register("det_pf_drawlist", lambda uv_min, uv_max: dpg.configure_item(
+            "det_pf_drawimage", uv_min=uv_min, uv_max=uv_max))
         dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._status_tag, wrap=730)
 
         with dpg.group(horizontal=True):
@@ -709,10 +693,18 @@ class DetectionTab:
             autosize_y=True,
             border=False,
         ):
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="<< Prev", width=120, callback=self._on_prev)
+                dpg.add_button(label="Next >>", width=120, callback=self._on_next)
+                dpg.add_text("", tag="det_cluster_time_info", wrap=600)
             dpg.add_image(
                 texture_tag="det_cluster_plot_texture",
                 tag="det_cluster_plot_image",
             )
+        self._view_zoom.register("det_cluster_plot_image", lambda uv_min, uv_max: dpg.configure_item(
+            "det_cluster_plot_image", uv_min=uv_min, uv_max=uv_max))
+        if self.preprocessing_tab is not None:  # time label follows the displayed frame, like the pseudo-frame's
+            self.preprocessing_tab.register_pseudoframe_mirror(status_tag="", time_info_tag="det_cluster_time_info")
         
     def _build_duration_hist_panel(self):
         with dpg.child_window(
@@ -920,7 +912,9 @@ class DetectionTab:
                 dpg.set_value("det_run_stats", "-")
         except Exception as e:
             dpg.set_value(self._run_status_tag, f"Input error: {e}")
+            self._run_active = False
             dpg.configure_item(self._run_button_tag, enabled=True)
+            dpg.configure_item("det_stop_button", enabled=False)  # no run started: nothing to stop
             return
 
         def worker():
@@ -1063,8 +1057,22 @@ class DetectionTab:
         self._refresh_in_progress = True
         try:
             self.refresh_defaults_from_preprocessing()
+            if self._plot_signature() != self._plotted_signature:
+                self._on_refresh_plots()
         finally:
             self._refresh_in_progress = False
+
+    def _plot_signature(self):
+        """Inputs of the plots: the events shown by Preprocessing (filtered or raw), the displayed frame, the
+        accumulation time and the detection results. Cheap: compared on every rendered frame of the tab, the
+        plots are redrawn when it changes."""
+        pt = self.preprocessing_tab
+        if pt is None:
+            return (id(self.last_result),)
+        events = pt.filtered_events if pt.filtered_events is not None else pt.raw_events
+        T = events[2] if events is not None else None
+        return (id(T), 0 if T is None else len(T), pt.display_t0,
+                float(pt.params.get("accumulation_time_ms", 0)), id(self.last_result))
             
             
     def refresh_defaults_from_preprocessing(self):
@@ -1490,41 +1498,6 @@ class DetectionTab:
     
         return xs, ys
       
-    def _on_pf_mouse_wheel(self, sender, app_data, user_data):
-        if not self._pf_zoom_enabled:
-            return
-
-        if not self._mouse_inside_item("det_pf_drawlist"):
-            return
-    
-        wheel = float(app_data)
-        if wheel == 0:
-            return
-    
-        factor = 1.15 if wheel > 0 else (1.0 / 1.15)
-    
-        u0, v0 = self._pf_uv_min
-        u1, v1 = self._pf_uv_max
-    
-        cu = (u0 + u1) * 0.5
-        cv = (v0 + v1) * 0.5
-        du = (u1 - u0) / factor
-        dv = (v1 - v0) / factor
-    
-        nu0 = max(0.0, cu - du * 0.5)
-        nu1 = min(1.0, cu + du * 0.5)
-        nv0 = max(0.0, cv - dv * 0.5)
-        nv1 = min(1.0, cv + dv * 0.5)
-    
-        if (nu1 - nu0) < 0.02 or (nv1 - nv0) < 0.02:
-            return
-    
-        self._pf_uv_min = [nu0, nv0]
-        self._pf_uv_max = [nu1, nv1]
-    
-        if dpg.does_item_exist("det_pf_drawimage"):
-            dpg.configure_item("det_pf_drawimage", uv_min=self._pf_uv_min, uv_max=self._pf_uv_max)
-        
     def _mouse_inside_item(self, item_tag: str) -> bool:
         if not dpg.does_item_exist(item_tag):
             return False
@@ -1556,6 +1529,7 @@ class DetectionTab:
             if line == "__DONE__":
                 if dpg.does_item_exist(self._run_status_tag):
                     dpg.set_value(self._run_status_tag, "Detection done.")
+                self._run_active = False
                 dpg.configure_item(self._run_button_tag, enabled=True)
                 dpg.configure_item("det_stop_button", enabled=False)
                 
@@ -1630,6 +1604,7 @@ class DetectionTab:
             dpg.set_value(self.cluster_texture_tag, empty.flatten())
           
     def _on_refresh_plots(self, sender=None, app_data=None, user_data=None):
+        self._plotted_signature = self._plot_signature()  # first: a failing refresh is not retried every frame
         try:
             self._update_pseudoframe_plot()
         except Exception as e:
@@ -1679,7 +1654,6 @@ class DetectionTab:
             self._status_log_append(f"[DETECTION] Refresh histogram failed: {e}")
     
         self._log_clusters_in_frame()
-        self._status_log_append("[DETECTION] Refreshed plots.")
 
     def _log_clusters_in_frame(self):
         # tells why the views can be empty: they only show clusters of the displayed frame
@@ -1788,10 +1762,13 @@ class DetectionTab:
             pass
 
     def on_det_load_results_path_typed(self, sender, app_data, user_data=None):
+        path = str(app_data).strip()
         try:
-            dpg.set_value("det_load_results_file_input", str(app_data).strip())
+            dpg.set_value("det_load_results_file_input", path)
         except Exception:
             pass
+        if path:  # Enter on a path loads it
+            self.load_detection_results()
 
     def browse_det_save_results_file(self, sender=None, app_data=None, user_data=None):
         if dpg.does_item_exist("det_save_results_file_dialog"):
@@ -1814,6 +1791,7 @@ class DetectionTab:
             dpg.set_value("det_load_results_status", "No file selected.")
             return
         dpg.set_value("det_load_results_file_input", path)
+        self.load_detection_results()  # selecting a file loads it
 
     def _build_results_payload_bytes(self):
         if self.last_result is None:
@@ -1872,6 +1850,7 @@ class DetectionTab:
                 return
 
             p = Path(path)
+            self._status_log_append(f"[DETECTION] Loading results: {p}")
             if not p.exists():
                 raise FileNotFoundError(p)
 
@@ -1913,14 +1892,13 @@ class DetectionTab:
             except Exception:
                 pass
 
-            try:
-                self._update_duration_histogram()
-            except Exception:
-                pass
+            self._on_refresh_plots()
 
             dpg.set_value("det_load_results_status", f"Loaded: {p}")
+            self._status_log_append(f"[DETECTION] Loaded results: {p.name}")
         except Exception as e:
             dpg.set_value("det_load_results_status", f"Load failed: {e}")
+            self._status_log_append(f"[DETECTION] Loading results failed: {e}")
             
     def _is_basic_serializable(self, v):
         import numpy as np

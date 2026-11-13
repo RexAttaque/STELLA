@@ -53,7 +53,7 @@ Larger datasets used as Benchmark and to train artificial neural networks can be
 To start the GUI, run `python main.py`. Changes in the set parameters are confirmed by pressing the enter key. As a small tutorial, the processing of experimental data is exemplified below:
 
 1) **Preprocessing**
-- select `datasets/experimental.npz` as data file and click on `load data`
+- select `datasets/experimental.npz` as data file (Browse, or paste its path and press Enter): it is loaded right away
 - set the accumulation time to 2 ms
       
 ![Preprocessing](images/Preprocessing.png)

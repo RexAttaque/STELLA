@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any, Optional, TYPE_CHECKING
 
 import dearpygui.dearpygui as dpg
+from interface.view_zoom import SharedZoom, overlay_transform
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -42,6 +43,8 @@ class ValidationTab:
         tracking_tab: Any = None,
     ) -> None:
         self.preprocessing_tab = preprocessing_tab
+        self._view_zoom = preprocessing_tab.view_zoom if preprocessing_tab is not None else SharedZoom()
+        self._pf_overlay_signature = None  # what the track overlay shows (see sync_pseudoframe_overlay)
         self.tracking_tab = tracking_tab
 
         self.params: dict[str, Any] = deepcopy(DEFAULT_PARAMS)
@@ -313,12 +316,11 @@ class ValidationTab:
                 pseudo_texture,
                 pmin=[0, 0],
                 pmax=[w, h],
-                uv_min=[0.0, 0.0],
-                uv_max=[1.0, 1.0],
                 tag=self._pf_drawimage_tag,
             )
             with dpg.draw_node(tag=self._pf_tracks_node_tag):
                 pass
+        self._view_zoom.register(self._pf_drawlist_tag, self._apply_view_zoom)
 
         dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._pf_status_tag, wrap=1200)
 
@@ -410,6 +412,7 @@ class ValidationTab:
                 pass
             with dpg.draw_node(tag=self._pf_tracks_node_tag, parent=self._pf_drawlist_tag):
                 pass
+            self._apply_view_zoom()
     
         self._status_log_append("Cleared validation results.")
         
@@ -424,6 +427,30 @@ class ValidationTab:
                 dpg.set_value(self._pf_timefactor_input_tag, v)
         self.params["track_timefactor"] = v
         self._update_validation_overlay()
+
+    def _apply_view_zoom(self, uv_min=None, uv_max=None) -> None:
+        """Shows the shared zoom region: image texture coordinates, and the track lines (drawn in whole-frame
+        coordinates) transformed to match."""
+        uv_min = self._view_zoom.uv_min if uv_min is None else uv_min
+        uv_max = self._view_zoom.uv_max if uv_max is None else uv_max
+        if dpg.does_item_exist(self._pf_drawimage_tag):
+            dpg.configure_item(self._pf_drawimage_tag, uv_min=uv_min, uv_max=uv_max)
+        if dpg.does_item_exist(self._pf_tracks_node_tag):
+            w, h = self.pseudoframe_dimensions
+            dpg.apply_transform(self._pf_tracks_node_tag, overlay_transform(uv_min, uv_max, w, h))
+
+    def sync_pseudoframe_overlay(self) -> None:
+        """Redraws the track overlay when the displayed frame (shared by all pages), the accumulation time or the
+        tracking results changed elsewhere, e.g. Prev / Next on another page. Called every frame; draws only when
+        shown."""
+        pt = self.preprocessing_tab
+        if pt is None or not dpg.does_item_exist(self._pf_drawlist_tag) or not dpg.is_item_visible(self._pf_drawlist_tag):
+            return
+        sig = (pt.display_t0, float(pt.params.get("accumulation_time_ms", 0)),
+               id(getattr(self.tracking_tab, "last_result", None)))
+        if sig != self._pf_overlay_signature:
+            self._pf_overlay_signature = sig
+            self._update_validation_overlay()
 
     def _on_pf_prev(self, sender=None, app_data=None, user_data=None):
         if self.preprocessing_tab is None:
@@ -653,6 +680,7 @@ class ValidationTab:
             pass
         with dpg.draw_node(tag=self._pf_tracks_node_tag, parent=self._pf_drawlist_tag):
             pass
+        self._apply_view_zoom()
     
         if self.preprocessing_tab is None or self.tracking_tab is None:
             return

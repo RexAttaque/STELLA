@@ -9,6 +9,7 @@ class LayoutManager:
         self.tabs = tabs
         self.main_window_tag = "main_window"
         self.detection_tab = next(t for t in self.tabs if t.__class__.__name__ == "DetectionTab")
+        self._tabs_by_key = {d.key: t for d, t in zip(TAB_DEFINITIONS, self.tabs)}  # used by _on_tab_change
 
     def build(self) -> None:
         dpg.create_context()
@@ -40,13 +41,21 @@ class LayoutManager:
                 dpg.add_theme_color(dpg.mvThemeCol_FrameBg, THEME_COLORS["frame_bg"])
                 dpg.add_theme_color(dpg.mvThemeCol_WindowBg, THEME_COLORS["window_bg"])
                 dpg.add_theme_color(dpg.mvThemeCol_ChildBg, THEME_COLORS["child_bg"])
+            # Dear PyGui draws disabled widgets like enabled ones unless the theme gives them their own colours
+            for item_type in (dpg.mvButton, dpg.mvInputInt, dpg.mvInputFloat, dpg.mvInputText, dpg.mvCheckbox,
+                              dpg.mvCombo, dpg.mvSliderInt, dpg.mvSliderFloat, dpg.mvDragInt, dpg.mvDragFloat):
+                with dpg.theme_component(item_type, enabled_state=False):
+                    for col in (dpg.mvThemeCol_Button, dpg.mvThemeCol_ButtonHovered, dpg.mvThemeCol_ButtonActive,
+                                dpg.mvThemeCol_FrameBg, dpg.mvThemeCol_FrameBgHovered, dpg.mvThemeCol_FrameBgActive):
+                        dpg.add_theme_color(col, THEME_COLORS["disabled_bg"])
+                    dpg.add_theme_color(dpg.mvThemeCol_Text, THEME_COLORS["disabled_text"])
         dpg.bind_theme(global_theme)
 
 
     def _on_tab_change(self, sender, app_data, user_data):
         try:
             det_tag = "tab_detection"
-            det_id = dpg.get_item_id(det_tag) if dpg.does_item_exist(det_tag) else None
+            det_id = dpg.get_alias_id(det_tag) if dpg.does_item_exist(det_tag) else None
             is_detection = (app_data == det_tag) or (det_id is not None and app_data == det_id)
     
             if is_detection:
@@ -54,5 +63,5 @@ class LayoutManager:
                 hook = getattr(det_tab, "on_tab_selected", None)
                 if callable(hook):
                     hook()
-        except Exception:
-            return
+        except Exception as e:  # never break tab switching, but do not hide the error either
+            print(f"[LAYOUT] tab change hook failed: {e}")

@@ -13,6 +13,7 @@ def _track_list(tracks):
     """Per-track arrays as a list (views of the flat array for PackedTracks)."""
     return list(tracks) if isinstance(tracks, PackedTracks) else tracks
 import dearpygui.dearpygui as dpg
+from interface.view_zoom import SharedZoom, overlay_transform
 import numpy as np
 import pickle
 import scipy.io as sio
@@ -60,6 +61,8 @@ class TrackingTab:
         detection_tab: Optional[DetectionTab] = None,
     ) -> None:
         self.preprocessing_tab = preprocessing_tab
+        self._view_zoom = preprocessing_tab.view_zoom if preprocessing_tab is not None else SharedZoom()
+        self._pf_overlay_signature = None  # what the track overlay shows (see sync_pseudoframe_overlay)
         self.detection_tab = detection_tab
 
         self.params: dict[str, Any] = deepcopy(DEFAULT_PARAMS)
@@ -119,8 +122,6 @@ class TrackingTab:
         self._track_run_stats_text_tag = "track_run_stats"
         
         self.pseudoframe_dimensions = PSEUDOFAME_DIMENSIONS
-        self._pf_uv_min = [0.0, 0.0]
-        self._pf_uv_max = [1.0, 1.0]
         
         self._pf_status_tag = "track_pseudoframe_status"
         self._pf_time_info_tag = "track_pseudoframe_time_info"
@@ -405,9 +406,9 @@ class TrackingTab:
         
         dpg.add_text("Load tracking results:", color=(200, 200, 100))
         with dpg.group(horizontal=True):
-            dpg.add_input_text(tag="track_load_results_file_input", width=300, hint="Load .npz or .mat")
+            dpg.add_input_text(tag="track_load_results_file_input", width=300, hint="Load .npz or .mat",
+                               callback=self.on_track_load_results_path_typed, on_enter=True)
             dpg.add_button(label="Browse", callback=self.browse_track_load_results_file, width=80)
-        dpg.add_button(label="Load results", callback=self.load_tracking_results, width=120)
         dpg.add_text("", tag="track_load_results_status", wrap=430, color=(100, 255, 100))
         
         if not dpg.does_item_exist("track_save_results_file_dialog"):
@@ -497,12 +498,11 @@ class TrackingTab:
                 pseudo_texture,
                 pmin=[0, 0],
                 pmax=[w, h],
-                uv_min=self._pf_uv_min,
-                uv_max=self._pf_uv_max,
                 tag=self._pf_drawimage_tag,
             )
             with dpg.draw_node(tag=self._pf_tracks_node_tag):
                 pass
+        self._view_zoom.register(self._pf_drawlist_tag, self._apply_view_zoom)
     
         dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._pf_status_tag, wrap=730)
     
@@ -1220,6 +1220,28 @@ class TrackingTab:
         self.params["track_timefactor"] = v
         self._update_tracking_pseudoframe_overlay()
         
+    def _apply_view_zoom(self, uv_min=None, uv_max=None) -> None:
+        """Shows the shared zoom region: image texture coordinates, and the track lines (drawn in whole-frame
+        coordinates) transformed to match."""
+        uv_min = self._view_zoom.uv_min if uv_min is None else uv_min
+        uv_max = self._view_zoom.uv_max if uv_max is None else uv_max
+        if dpg.does_item_exist(self._pf_drawimage_tag):
+            dpg.configure_item(self._pf_drawimage_tag, uv_min=uv_min, uv_max=uv_max)
+        if dpg.does_item_exist(self._pf_tracks_node_tag):
+            w, h = self.pseudoframe_dimensions
+            dpg.apply_transform(self._pf_tracks_node_tag, overlay_transform(uv_min, uv_max, w, h))
+
+    def sync_pseudoframe_overlay(self) -> None:
+        """Redraws the track overlay when the displayed frame (shared by all pages), the accumulation time or the
+        results changed elsewhere, e.g. Prev / Next on another page. Called every frame; draws only when shown."""
+        pt = self.preprocessing_tab
+        if pt is None or not dpg.does_item_exist(self._pf_drawlist_tag) or not dpg.is_item_visible(self._pf_drawlist_tag):
+            return
+        sig = (pt.display_t0, float(pt.params.get("accumulation_time_ms", 0)), id(self.last_result))
+        if sig != self._pf_overlay_signature:
+            self._pf_overlay_signature = sig
+            self._update_tracking_pseudoframe_overlay()
+
     def _on_pf_prev(self, sender=None, app_data=None, user_data=None):
         if self.preprocessing_tab is None:
             return
@@ -1241,6 +1263,8 @@ class TrackingTab:
         
         with dpg.draw_node(tag=self._pf_tracks_node_tag, parent=self._pf_drawlist_tag):
             pass
+        
+        self._apply_view_zoom()
     
         if self.preprocessing_tab is None or self.last_result is None:
             return
@@ -1516,6 +1540,11 @@ class TrackingTab:
         path = str(app_data.get("file_path_name", "")).strip()
         if path:
             dpg.set_value("track_load_results_file_input", path)
+            self.load_tracking_results()  # selecting a file loads it
+
+    def on_track_load_results_path_typed(self, sender, app_data, user_data=None):
+        if str(app_data).strip():  # Enter on a path loads it
+            self.load_tracking_results()
     
     def save_tracking_results(self, sender=None, app_data=None, user_data=None):
         try:
@@ -1563,9 +1592,10 @@ class TrackingTab:
                 return
     
             p = Path(path)
+            self._status_log_append(f"[TRACKING] Loading results: {p}")
             if not p.exists():
                 raise FileNotFoundError(p)
-    
+
             if p.suffix.lower() == ".npz":
                 data = np.load(p, allow_pickle=True)
                 result_bytes = bytes(np.array(data["result_pickle"], dtype=np.uint8).tobytes())
@@ -1592,8 +1622,10 @@ class TrackingTab:
                 dpg.set_value(self._track_run_stats_text_tag, f"Loaded results from: {p.name}")
     
             dpg.set_value("track_load_results_status", f"Loaded: {p}")
+            self._status_log_append(f"[TRACKING] Loaded results: {p.name}")
         except Exception as e:
             dpg.set_value("track_load_results_status", f"Load failed: {e}")
+            self._status_log_append(f"[TRACKING] Loading results failed: {e}")
             
     def apply_loaded_track_ctx_to_gui(self, ctx: dict[str, Any]):
         if not isinstance(ctx, dict):

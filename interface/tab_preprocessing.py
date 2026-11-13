@@ -5,6 +5,7 @@ from typing import Any, Optional, Sequence
 
 import dearpygui.dearpygui as dpg
 import numpy as np
+from interface.view_zoom import SharedZoom
 from config.constants import (
     DEFAULT_PARAMS,
     PSEUDOFAME_DIMENSIONS,
@@ -49,6 +50,7 @@ class PreprocessingTab:
     label: str = "Preprocessing"
 
     def __init__(self) -> None:
+        self.view_zoom = SharedZoom()  # zoom of every sensor view, on all tabs
         self.params: dict[str, Any] = deepcopy(DEFAULT_PARAMS)
         self.data_file: str = ""
         self.output_dir: str = ""
@@ -133,7 +135,6 @@ class PreprocessingTab:
         formats_text = " | ".join(self.supported_formats)
         dpg.add_text("Supported File Types:", color=(150, 200, 150))
         dpg.add_text(formats_text, color=(180, 180, 180), wrap=700)
-        dpg.add_button(label="load data", callback=self.validate_file, width=100)
         dpg.add_text("", tag="validation_status", color=(100, 255, 100))
         dpg.add_separator()
         dpg.add_text("DATA PREVIEW", color=(100, 200, 255))
@@ -286,6 +287,8 @@ class PreprocessingTab:
         except Exception:
             pass
         dpg.add_image(self.pseudoframe_texture_tag, width=self.pseudoframe_dimensions[0], height=self.pseudoframe_dimensions[1], tag="preprocessing_pseudoframe_image")
+        self.view_zoom.register("preprocessing_pseudoframe_image", lambda uv_min, uv_max: dpg.configure_item(
+            "preprocessing_pseudoframe_image", uv_min=uv_min, uv_max=uv_max))
         dpg.add_text("Load data to generate pseudo-frame.", tag="preprocessing_pseudoframe_status", wrap=730)
         
         with dpg.group(horizontal=True):
@@ -313,9 +316,9 @@ class PreprocessingTab:
             dpg.set_value("data_file_input", self.data_file)
             if dpg.does_item_exist("preprocessing_file_display"):
                 dpg.set_value("preprocessing_file_display", f"{Path(self.data_file).name}")
-            dpg.set_value("validation_status", "File selected. Click 'load data' to verify.")
             self.log_status(f"File selected: {self.data_file}")
             self.update_preprocessing_parameters_display()
+            self.validate_file()  # selecting a file loads it
             
     def on_data_file_path_typed(self, sender, app_data) -> None:
         path = (app_data or "").strip().strip('"').strip("'")
@@ -329,11 +332,9 @@ class PreprocessingTab:
         self.data_file = path
         dpg.set_value("data_file_input", self.data_file)
     
-        if dpg.does_item_exist("validation_status"):
-            dpg.set_value("validation_status", "File path entered. Click 'load data' to verify.")
-    
         self.log_status(f"File path entered: {self.data_file}")
         self.update_preprocessing_parameters_display()
+        self.validate_file()  # Enter on a path loads it
 
     def validate_file(self, sender=None, app_data=None, user_data=None) -> None:
         if not self.data_file:
@@ -341,6 +342,7 @@ class PreprocessingTab:
             return
         try:
             dpg.set_value("validation_status", "loading...")
+            self.log_status(f"Loading file: {self.data_file}")
             loaded = load_data_file(self.data_file)
 
             if loaded.width is not None:
@@ -352,10 +354,10 @@ class PreprocessingTab:
             self.last_loaded_file_ext = loaded.file_ext
             self.load_data_preview(loaded)
             dpg.set_value("validation_status", loaded.status_message)
-            self.log_status(f"File validated successfully: {self.data_file}")
+            self.log_status(f"File loaded: {self.data_file}")
         except Exception as exc:
             dpg.set_value("validation_status", f"Error: {exc}")
-            self.log_status(f"File validation failed: {exc}")
+            self.log_status(f"Loading file failed: {exc}")
 
     def load_data_preview(self, loaded=None) -> None:
         if not self.data_file:
