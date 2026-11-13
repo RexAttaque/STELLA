@@ -29,6 +29,14 @@ except ImportError:  # numpy < 2
     from numpy.linalg.linalg import _raise_linalgerror_lstsq
 
 
+def _lstsq_gufunc(m, n):
+    """numpy's lstsq gufunc for (m, n) matrices: numpy >= 2 has a single one, numpy < 2 one per shape case
+    (lstsq_m when m <= n, lstsq_n otherwise), chosen as np.linalg.lstsq does."""
+    if hasattr(_umath_linalg, 'lstsq'):
+        return _umath_linalg.lstsq
+    return _umath_linalg.lstsq_m if m <= n else _umath_linalg.lstsq_n
+
+
 @njit(cache=True, nogil=True, parallel=True)
 def _fit_points(t, off, st_max, dtt, inclusive):
     """Points of every (time-sorted) track used for its initial state, as process_index_afterwards selects them:
@@ -62,7 +70,7 @@ def _lstsq_slopes(T, V):
     A[:, :, 1] = 1.0
     rcond = np.finfo(np.float64).eps * max(m, 2)
     with np.errstate(call=_raise_linalgerror_lstsq, invalid='call', over='ignore', divide='ignore', under='ignore'):
-        sol = _umath_linalg.lstsq(A, V[:, :, None], rcond, signature='ddd->ddid')[0]
+        sol = _lstsq_gufunc(m, 2)(A, V[:, :, None], rcond, signature='ddd->ddid')[0]
     return sol[:, 0, 0]
 
 
