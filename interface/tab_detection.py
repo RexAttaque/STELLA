@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from utils.plots import figure_to_rgba_flat
 from utils.raster import binary_rgba, draw_dots, scalar_rgba
 from utils.packed_tracks import PackedTracks
+from utils import parallel
 from matplotlib.colors import ListedColormap
 from datetime import datetime
 import sys, io, contextlib, threading, queue
@@ -104,6 +105,8 @@ class DetectionTab:
         self.params.setdefault("N", 1)
         self.params.setdefault("multirun", False)
         self.params.setdefault("multitimefactor", 2)
+        self.params.setdefault("cpu_threads", 0)  # threads of the compiled kernels, 0 = automatic
+        parallel.set_threads(self.params["cpu_threads"])
         
         self.params.setdefault("threshold", 7.5)
         self._group_matching_dbscan = "det_group_matching_dbscan"
@@ -495,6 +498,28 @@ class DetectionTab:
                         "slower particles."
                     )
         
+        with dpg.group(horizontal=True):
+            dpg.add_input_int(
+                label="CPU threads (0 = auto)",
+                default_value=int(self.params.get("cpu_threads", 0)),
+                min_value=0,
+                max_value=parallel.available(),
+                min_clamped=True,
+                max_clamped=True,
+                width=150,
+                callback=self._on_cpu_threads_change,
+                tag="det_input_cpu_threads",
+            )
+            dpg.add_button(label="?", width=22, height=22, tag="cpu_threads_info_btn")
+            dpg.bind_item_theme("cpu_threads_info_btn", info_button_theme)
+            with dpg.popup("cpu_threads_info_btn", mousebutton=dpg.mvMouseButton_Left):
+                dpg.add_text(
+                    "Threads used by the compiled detection code.\n"
+                    f"0 = automatic: {parallel.auto()} of the {parallel.available()} logical CPUs; the others\n"
+                    "prepare the next time steps and keep the\n"
+                    "interface responsive."
+                )
+
         with dpg.group(tag=self._group_matching_dbscan, show=False):
             dpg.add_input_float(
                 label="allowed distance for cluster matching",
@@ -1009,6 +1034,11 @@ class DetectionTab:
             show=(app_data in ("DBSCAN", "pseudo-frame"))
         )
     
+    def _on_cpu_threads_change(self, sender, app_data, user_data):
+        self.params["cpu_threads"] = int(app_data)
+        n = parallel.set_threads(int(app_data))
+        self._status_log_append(f"CPU threads for detection: {n}")
+
     def _on_multirun_change(self, sender, app_data, user_data):
         enabled = bool(app_data)
         self.params["multirun"] = enabled

@@ -8,6 +8,10 @@ from utils_spline_v1 import *
 from joblib import Parallel, delayed, parallel_backend
 from scipy.ndimage import uniform_filter1d
 from tqdm import tqdm
+try:
+    from utils.tracking_batch import kalman_afterwards, postprocess_afterwards
+except ImportError:
+    from tracking_batch import kalman_afterwards, postprocess_afterwards
 import multiprocessing
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -31,58 +35,36 @@ x_est = [[] for _ in range(max_tracks)]
 y_est = [[] for _ in range(max_tracks)]
 x_temp = np.zeros(max_tracks)
 y_temp = np.zeros(max_tracks)
+
+
+def _kalman_all(ex_len):
+    """process_index_afterwards (process_index_lightweight_afterwards) for every cluster, batched: same results,
+    clusters sorted in place the same way (utils/tracking_batch.py)."""
+    bar = tqdm(total=ex_len, desc="Kalman")
+
+    def progress(done):
+        bar.update(done - bar.n)
+
+    if lightweight_mode or pseudo_images:
+        res = kalman_afterwards(t_m, x_m, y_m, P, C, Q, R, dt, resol,
+                                Kalman_v2_both_buffer_optimized_lightweight_afterwards, num_worker,
+                                st_max=4, inclusive=True, p_scale=50, start_id=0, progress=progress)
+    else:
+        res = kalman_afterwards(t_clust, x_clust, y_clust, P, C, Q, R, dt, resol,
+                                Kalman_v2_both_buffer_optimized_afterwards, num_worker, progress=progress)
+    bar.close()
+    return res
+
+
 #%% main loop
 # Kalman filter afterwards
 if Kalman_afterwards or use_both or both2:
-    if lightweight_mode or pseudo_images:
-        partial_func = partial(
-            process_index_lightweight_afterwards,
-            P=P,
-            t_m=t_m,
-            x_m=x_m,
-            y_m=y_m,
-            C=C,
-            Q=Q,
-            R=R,
-            P_new=P_new,
-            x_est=x_est,
-            P_newz=P_newz,
-            y_est=y_est,
-            Kalman_v2_both_optimized=Kalman_v2_both_optimized_lightweight,
-            Kalman_v2_both_buffer_optimized=Kalman_v2_both_buffer_optimized_lightweight_afterwards,
-            dtt=dt,
-            factor=resol
-        )
-    else:   
-        partial_func = partial(
-            process_index_afterwards,
-            P=P,
-            t_clust=t_clust,
-            x_clust=x_clust,
-            y_clust=y_clust,
-            C=C,
-            Q=Q,
-            R=R,
-            P_new=P_new,
-            x_est=x_est,
-            P_newz=P_newz,
-            y_est=y_est,
-            Kalman_v2_both_optimized=Kalman_v2_both_optimized,
-            Kalman_v2_both_buffer_optimized=Kalman_v2_both_buffer_optimized_afterwards,
-            dtt = dt,
-            factor=resol
-        )
     if lightweight_mode==False:
         ex_len = len(x_clust)
     else:
         ex_len = len(t_m)
     track_to_cluster[:ex_len] = np.arange(ex_len, dtype=int)
-    with ThreadPoolExecutor(max_workers=num_worker) as executor:
-        results_iterator = executor.map(partial_func, range(ex_len))
-
-        results = []
-        for r in tqdm(results_iterator, total=ex_len, desc="Kalman"):
-            results.append(r)
+    results = _kalman_all(ex_len)
 
     for i, result in results:
         if result is None:
@@ -130,45 +112,55 @@ if Kalman_afterwards or use_both or both2:
                 y_plot = [res[1] for res in results]
                 t_plot = [res[2] for res in results]
     
-    valid_idx = [i for i, a in enumerate(x_plot) if not np.isnan(a).all()]
-    track_to_cluster = track_to_cluster[valid_idx]
-    t_plot = [t_plot[i] for i in valid_idx]
-    x_plot = [x_plot[i] for i in valid_idx]
-    x_plota = [x_plota[i] for i in valid_idx]
-    y_plot = [y_plot[i] for i in valid_idx]
-    y_plota = [y_plota[i] for i in valid_idx]
-    if use_both or both2:
-        x_plotv = [x_plotv[i] for i in valid_idx]
-        y_plotv = [y_plotv[i] for i in valid_idx]
+    _pp = postprocess_afterwards(t_plot, x_plot, x_plotv, x_plota, y_plot, y_plotv, y_plota,
+                                 1.0 if (use_both or both2) else 1e-6)
+    if _pp is not None:  # all tracks in one parallel pass (utils/tracking_batch.py): same results as below
+        valid_idx, t_plot, x_plot, x_plotv, x_plota, y_plot, y_plotv, y_plota = _pp
+        track_to_cluster = track_to_cluster[valid_idx]
+        _kept = valid_idx.tolist()
+        t_clust = [t_clust[i] for i in _kept]
+        x_clust = [x_clust[i] for i in _kept]
+        y_clust = [y_clust[i] for i in _kept]
     else:
-        x_plotv = [x_plotv[i]*1e-6 for i in valid_idx]
-        y_plotv = [y_plotv[i]*1e-6 for i in valid_idx]
+        valid_idx = [i for i, a in enumerate(x_plot) if not np.isnan(a).all()]
+        track_to_cluster = track_to_cluster[valid_idx]
+        t_plot = [t_plot[i] for i in valid_idx]
+        x_plot = [x_plot[i] for i in valid_idx]
+        x_plota = [x_plota[i] for i in valid_idx]
+        y_plot = [y_plot[i] for i in valid_idx]
+        y_plota = [y_plota[i] for i in valid_idx]
+        if use_both or both2:
+            x_plotv = [x_plotv[i] for i in valid_idx]
+            y_plotv = [y_plotv[i] for i in valid_idx]
+        else:
+            x_plotv = [x_plotv[i]*1e-6 for i in valid_idx]
+            y_plotv = [y_plotv[i]*1e-6 for i in valid_idx]
     
-    t_clust = [t_clust[i] for i in valid_idx]
-    x_clust = [x_clust[i] for i in valid_idx]
-    y_clust = [y_clust[i] for i in valid_idx]
+        t_clust = [t_clust[i] for i in valid_idx]
+        x_clust = [x_clust[i] for i in valid_idx]
+        y_clust = [y_clust[i] for i in valid_idx]
     
-    t_plot = [arr[~np.isnan(arr)] for arr in t_plot]
-    x_plot = [arr[~np.isnan(arr)] for arr in x_plot]
-    y_plot = [arr[~np.isnan(arr)] for arr in y_plot]
-    x_plotv = [arr[~np.isnan(arr)] for arr in x_plotv]
-    x_plota = [arr[~np.isnan(arr)] for arr in x_plota]
-    y_plotv = [arr[~np.isnan(arr)] for arr in y_plotv]
-    y_plota = [arr[~np.isnan(arr)] for arr in y_plota]
-    t_plot = [t if len(x) > 0 else np.array([]) for x, t in zip(x_plot, t_plot)]
+        t_plot = [arr[~np.isnan(arr)] for arr in t_plot]
+        x_plot = [arr[~np.isnan(arr)] for arr in x_plot]
+        y_plot = [arr[~np.isnan(arr)] for arr in y_plot]
+        x_plotv = [arr[~np.isnan(arr)] for arr in x_plotv]
+        x_plota = [arr[~np.isnan(arr)] for arr in x_plota]
+        y_plotv = [arr[~np.isnan(arr)] for arr in y_plotv]
+        y_plota = [arr[~np.isnan(arr)] for arr in y_plota]
+        t_plot = [t if len(x) > 0 else np.array([]) for x, t in zip(x_plot, t_plot)]
     
-    for ij in range(2):
-        x_plot = [uniform_filter1d(a, size=3, mode='nearest') for a in x_plot]
-        x_plotv = [uniform_filter1d(a, size=3, mode='nearest') for a in x_plotv]
-        y_plot = [uniform_filter1d(a, size=3,  mode='nearest') for a in y_plot]
-        y_plotv = [uniform_filter1d(a, size=3,  mode='nearest') for a in y_plotv]
+        for ij in range(2):
+            x_plot = [uniform_filter1d(a, size=3, mode='nearest') for a in x_plot]
+            x_plotv = [uniform_filter1d(a, size=3, mode='nearest') for a in x_plotv]
+            y_plot = [uniform_filter1d(a, size=3,  mode='nearest') for a in y_plot]
+            y_plotv = [uniform_filter1d(a, size=3,  mode='nearest') for a in y_plotv]
         
-    for j, arr in enumerate(x_plot):
-        if len(arr) < len(x_plotv[j]):
-            x_plotv[j] = x_plotv[j][:len(arr)]
-            x_plota[j] = x_plota[j][:len(arr)]
-            y_plotv[j] = y_plotv[j][:len(arr)]
-            y_plota[j] = y_plota[j][:len(arr)]
+        for j, arr in enumerate(x_plot):
+            if len(arr) < len(x_plotv[j]):
+                x_plotv[j] = x_plotv[j][:len(arr)]
+                x_plota[j] = x_plota[j][:len(arr)]
+                y_plotv[j] = y_plotv[j][:len(arr)]
+                y_plota[j] = y_plota[j][:len(arr)]
                     
     
 if both2:
@@ -330,55 +322,12 @@ if spline_fitting or use_both:
 
 if use_hybrid:
     # Kalman filter
-    if lightweight_mode or pseudo_images:
-        partial_func = partial(
-            process_index_lightweight_afterwards,
-            P=P,
-            t_m=t_m,
-            x_m=x_m,
-            y_m=y_m,
-            C=C,
-            Q=Q,
-            R=R,
-            P_new=P_new,
-            x_est=x_est,
-            P_newz=P_newz,
-            y_est=y_est,
-            Kalman_v2_both_optimized=Kalman_v2_both_optimized_lightweight,
-            Kalman_v2_both_buffer_optimized=Kalman_v2_both_buffer_optimized_lightweight_afterwards,
-            dtt=dt,
-            factor=resol
-        )
-    else:   
-        partial_func = partial(
-            process_index_afterwards,
-            P=P,
-            t_clust=t_clust,
-            x_clust=x_clust,
-            y_clust=y_clust,
-            C=C,
-            Q=Q,
-            R=R,
-            P_new=P_new,
-            x_est=x_est,
-            P_newz=P_newz,
-            y_est=y_est,
-            Kalman_v2_both_optimized=Kalman_v2_both_optimized,
-            Kalman_v2_both_buffer_optimized=Kalman_v2_both_buffer_optimized_afterwards,
-            dtt = dt,
-            factor = resol
-        )
     if lightweight_mode==False:
         ex_len = len(x_clust)
     else:
         ex_len = len(t_m)
     track_to_cluster[:ex_len] = np.arange(ex_len, dtype=int)
-    with ThreadPoolExecutor(max_workers=num_worker) as executor:
-        results_iterator = executor.map(partial_func, range(ex_len))
-
-        results = []
-        for r in tqdm(results_iterator, total=ex_len, desc="Kalman"):
-            results.append(r)
+    results = _kalman_all(ex_len)
 
     for i, result in results:
         if result is None:
