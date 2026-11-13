@@ -1,18 +1,19 @@
 """CPU threads of the compiled (numba) parallel kernels.
 
-The number of threads is a setting of the detection tab (0 = automatic). Automatic leaves three logical CPUs to
-the threads that work beside the kernels: the two threads preparing the next detection steps (time window and
+The number of threads is a setting of the detection tab (0 = automatic). Automatic leaves four logical CPUs to
+the threads that work beside the kernels: the three threads preparing the next detection steps (time window and
 labelling) and the GUI. That is faster than taking every CPU: numba's OpenMP threads keep spinning ~0.1 s after
 each parallel loop (then sleep), and a detection step runs several short loops, so with every CPU taken the
-preparing threads would wait for a core. On an 8-core / 16-thread CPU, 553 M events: 16 threads with passive
-waiting 32.3 s, 13 threads 28.7 s.
+preparing threads would wait for a core. On an 8-core / 16-thread CPU, 553 M events (two preparing threads):
+16 kernel threads with passive waiting 32.3 s, 13 threads 28.7 s; with three preparing threads and 12 kernel
+threads 20.8 s (22.6 s with two).
 
 numba applies the number per calling thread, so code running in a worker thread (the detection script) calls
 apply() first. Every module with parallel kernels imports this one.
 """
 import numba
 
-RESERVED = 3  # logical CPUs left to the step-preparing threads and the GUI when automatic
+RESERVED = 4  # logical CPUs left to the step-preparing threads and the GUI when automatic
 
 _threads = 0  # 0: automatic
 

@@ -121,7 +121,7 @@ _tracker = None
 _pending = collections.deque()  # steps being prepared (in order) while the current one is matched
 _next_k = 1  # next step to submit
 if _fast_pixelwise:
-    _n_prep = 2  # preparing threads: the labelling of a step takes about as long as its matching
+    _n_prep = 3  # preparing threads: labelling + grouping a step take longer than matching it
     _pool = ThreadPoolExecutor(max_workers=_n_prep)
     _tls = threading.local()  # one label_events scratch map per preparing thread
     _label_offs = dilation_offsets(structure)  # pixels the dilation sets around one pixel ([[0, 0]] for 1x1)
