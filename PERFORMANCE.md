@@ -1,4 +1,4 @@
-# Performance work in this fork (`performance`, `numba_convert`, `flat-array_and_optim` and `KD_tree_replace` branches)
+# Performance work in this fork (`performance`, `numba_convert`, `flat-array_and_optim`, `KD_tree_replace` and `parallel` branches)
 
 STELLA was very slow on real recordings: stepping through the pseudo-frames of a few-seconds recording took
 minutes, and a full detection run could take hours or fail. This branch profiles and optimises it without changing
@@ -77,6 +77,48 @@ different ends, the joined start and end are 3.1 px apart on average instead of 
 The first commit of the branch (`ff0de96`, "Search track-repair links in parallel") keeps the tree order and
 identical results, with the link search at 1.3 s + 0.9 s.
 
+### `parallel` branch: all CPU cores, same results
+
+Everything that took noticeable time now runs on all CPU cores. Results are identical to `KD_tree_replace`.
+Times on an 8-core / 16-thread CPU (Ryzen 7 7800X3D), measured back to back:
+
+| | `KD_tree_replace` | `parallel` |
+|---|---|---|
+| Loading the 553 M-event `.raw` | ~10 s | 1.8 s |
+| Detection, 553 M events (5988 steps) | 47.6 s | 20.8 s |
+| Detection, 96 M events (7682 steps) | 8.1 s | 5.1 s |
+| Detection, 96 M events, mask size 3, 400 steps | 5.7 s | 1.8 s |
+| Detection, 96 M events, mask size 2 + multi-run, 800 steps | 11.5 s | 2.7 s |
+| Kalman tracking, 286 000 tracks (whole 96 M-event recording) | 47.0 s | 9.8 s |
+| Validation, neighbourhood filter, 58 000 tracks | 109 s | 5.5 s |
+
+- **Matching** (`_match`): a step's regions were matched one after the other because a cluster taken by a region
+  leaves the label map for the next ones. That is the only link between regions, so the step now runs in passes:
+  the clusters under every region and the split of shared regions in parallel; then one short sequential pass
+  in the original order that removes the clusters already taken (and recomputes a split only when one of its
+  clusters was taken); then the matched clusters (event copies, medians, history) in parallel, each written
+  where the sequential loop wrote it. 6.5 ms -> 1.4 ms per step on the large recording.
+- **Labelling** is compiled for every mask size (the dilation too, same labels as scipy), and three threads
+  prepare the next steps (time window, labelling, grouping by region) while the current one is matched. Mask
+  sizes 2 and 3 no longer go through scipy (10-13 ms per step -> 2.5-3.5 ms).
+- **End of pass**: the history log stores one track id per cluster and step instead of one per event
+  (1.4 GB less on the large recording) and is assembled in parallel (1.8 s -> 0.4 s).
+- **Loading**: the EVT 3.0 decoder runs on chunks of the file in parallel. The decoder state at the start of each
+  chunk (time base, last time, y, x base, polarity) comes from per-chunk summaries chained in order; the events
+  are then counted and written per chunk into arrays of the exact size, times directly as float64.
+- **Tracking** (Kalman and the hybrids): the least-squares start estimates of all tracks with the same number of
+  points go to numpy's `lstsq` in one call; the compiled Kalman filter runs over chunks of tracks in the worker
+  threads (only it releases the GIL, so one task per track mostly waited); the post-processing (NaN removal,
+  smoothing, truncation) is one parallel compiled pass.
+- **Validation**: the neighbourhood filter scanned every track for every time bin; the points of all bins are
+  now gathered in one pass.
+- **CPU threads** (`utils/parallel.py`, detection tab, "CPU threads (0 = auto)"): automatic uses every logical CPU
+  but four, left to the three step-preparing threads and the GUI. numba's OpenMP threads spin ~0.1 s after each
+  parallel loop before sleeping; with every CPU taken, the preparing threads would wait for a core (16 kernel
+  threads 32 s vs 12 threads 20.8 s). Steps with fewer than 20 000 events run on one thread: waking the threads
+  costs more than they save (the whole 96 M-event recording: 8.8 s parallel vs 6.3 s serial before the third
+  preparing thread).
+
 ## Verification
 
 - `.raw` decoding gives exactly the same events as pyEBIV (all 96 170 404 events compared).
@@ -95,6 +137,14 @@ identical results, with the link search at 1.3 s + 0.9 s.
 - `KD_tree_replace`: the link search gives the same links as a brute-force nearest-first search on 300 random
   cases (149 000 links), and the list and flat-array versions of `repair_tracks` give identical tracks. Its first
   commit (tree order kept) gives outputs identical to `flat-array_and_optim` in every mode listed above.
+- `parallel`: every detection output identical (dtype, length and bytes of every array) to `KD_tree_replace` on
+  both whole recordings (the large one loaded with the new decoder), with multi-run, mask sizes 2 and 3 and the
+  Python matching path; the compiled matching also on captured real steps with one thread and with 16. The
+  parallel decoder gives the same events as the sequential one on both recordings and on 400 random word streams
+  cut into chunks of 3-200 words; the compiled labelling matches scipy (dilation included) on 6000 random cases
+  and on real steps. Tracking outputs are identical in every mode using the Kalman stage (Kalman, with
+  correction, the three hybrids, lightweight); the validation flags and deviations are identical on all 58 000
+  tracks.
 - Tracking: Kalman filter identical within 1e-8 relative, B-spline identical, hybrid within 2e-7 relative
   (floating-point summation order).
 
@@ -166,6 +216,22 @@ identical results, with the link search at 1.3 s + 0.9 s.
   link, through the same time / space grid as before. `_pick_links` then takes the starts in ascending order and
   links each one to its nearest end that is not used yet. `cKDTree` is no longer imported.
 
+**All cores, `parallel` branch** (`utils/pixelwise_numba.py`, `utils/detection.py`, `utils/parallel.py`, new;
+`utils/raw_loader.py`, `utils/dataloader.py`, `utils/tracking_batch.py`, new; `utils/tracking.py`,
+`interface/tab_detection.py`, `interface/tab_validation.py`)
+- `_match` and `_create` are parallel count / resolve / fill passes (see Results); `label_events` takes the
+  dilation offsets; `_group` runs in the preparing threads; the history log is stored as runs.
+- `utils/parallel.py` holds the thread count; every module with parallel kernels imports it, and the detection
+  script applies it to its thread (numba's count is per thread).
+- `raw_loader._decode` is the chunked parallel decoder. Its `max_events` limit is now exact: the sequential decoder
+  checked it only between words, so a vector word could write up to 11 events past its buffers (only for files
+  above the limit, 700 M events by default).
+- `tracking_batch.kalman_afterwards` / `postprocess_afterwards` replace the per-track thread pool and the
+  per-track post-processing; the smoothing reproduces `scipy.ndimage.uniform_filter1d(size=3, mode='nearest')`
+  operation for operation (running sum divided at output), hence identical bits. Arrays of another dtype take the
+  per-track code.
+- `ValidationTab._points_by_time_bin` gathers the points of all time bins; the per-point statistics are unchanged.
+
 **Tracking** (`utils/kalman_filter_v2.py`, `interface/tab_tracking.py`, `interface/tab_validation.py`)
 - The Kalman filter measures position only (C = [1, 0, 0]), so the innovation covariance is a scalar: a scalar
   numba step replaces the matrix inversion (the general path is kept for other models).
@@ -189,6 +255,34 @@ identical results, with the link search at 1.3 s + 0.9 s.
 - A cross-correlation (optical flow) detection method, which would profit from a GPU (~20x measured with CuPy
   for pseudo-frame cross-correlation), was left for later.
 
+### GPU assessment (`parallel` branch)
+
+Where the 20.8 s of the large recording go: matching ~8 s on the main thread (1.4 ms per step); labelling and
+grouping ~20 s of thread time on the three preparing threads, in parallel with the matching; end of pass ~6 s
+(track repair 4 s, export 1.6 s); step 0 and setup ~1.5 s.
+
+| Candidate | Fit for a GPU | Expected gain |
+|---|---|---|
+| Labelling + grouping of many steps at once | Good: per-pixel union-find, steps independent | 1-2 s (frees the preparing threads' cores for the matching) |
+| Matching | The parallel passes are count / prefix-sum / fill kernels over flat arrays and port directly; the resolution pass is sequential in every step (one GPU thread or a CPU round trip per step); the whole tracker state must live on the GPU | 3-5 s, large port |
+| End-of-pass gathers (350 M events) | Memory-bound, fast on a GPU, but ~7 GB of events cross PCIe each way unless they already live there | ~3 s |
+| Loading | Chunked decoding ports, file read stays | <= 1 s |
+
+A GPU path for the first three could bring the detection to roughly 12-14 s. Not recommended yet: on large
+recordings the remaining costs are now after the detection (next section) and can be compiled on the CPU first. The
+kernels were written so that a port stays possible: flat arrays, counts then prefix sums then independent writes.
+
+### Remaining CPU work, not done to keep identical results
+
+- Tracking still spends ~30 us of Python per track (numpy's sort per track, which fixes the order of equal times,
+  and the per-track result objects): about 80 s for the 2.3 million tracks of the large recording. Fully compiled,
+  it would take a few seconds, with results equal within floating-point precision but not bit for bit (sort order
+  of equal times, LAPACK vs closed-form least squares).
+- Validation: the per-point neighbourhood statistics (5.5 s for 58 000 tracks) and the quality filter (3.5 s) are
+  per-point / per-track numpy. Compiled, ~100x faster, but `np.exp` and the sort order of ties could differ in the
+  last bit and flip a flag in rare cases.
+- Step 0 of the detection still runs the original Python code (~1 s).
+
 ## Installation and use
 
 Unchanged from the main README: Python 3.12, `pip install -r requirements.txt`, `python main.py`. numba was already
@@ -200,5 +294,5 @@ To update an existing STELLA clone to one of these branches:
 ```
 git remote add fork https://github.com/RexAttaque/STELLA.git
 git fetch fork
-git checkout -b performance fork/performance       # or numba_convert, flat-array_and_optim, KD_tree_replace
+git checkout -b performance fork/performance       # or numba_convert, flat-array_and_optim, KD_tree_replace, parallel
 ```
