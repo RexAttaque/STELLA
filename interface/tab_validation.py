@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
+from utils.paths import default_files_dir
 from utils.track_index import tracks_in_window
 
 if TYPE_CHECKING:
@@ -288,6 +289,7 @@ class ValidationTab:
                 tag="vali_save_results_file_dialog",
                 label="Save validated tracks",
                 directory_selector=False,
+                default_path=default_files_dir(),
                 show=False,
                 callback=self.on_vali_save_results_file_selected,
                 cancel_callback=lambda s, a: dpg.set_value("vali_save_results_status", "Save cancelled"),

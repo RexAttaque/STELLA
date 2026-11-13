@@ -3,6 +3,7 @@ from copy import deepcopy
 from typing import Any, Optional, TYPE_CHECKING
 from matplotlib import colormaps
 import matplotlib.pyplot as plt
+from utils.paths import default_files_dir
 from utils.plots import figure_to_rgba_flat
 from utils.track_index import tracks_in_window
 from utils.packed_tracks import PackedTracks
@@ -414,6 +415,7 @@ class TrackingTab:
                 tag="track_save_results_file_dialog",
                 label="Save tracking results",
                 directory_selector=False,
+                default_path=default_files_dir(),
                 show=False,
                 callback=self.on_track_save_results_file_selected,
                 cancel_callback=lambda s, a: dpg.set_value("track_save_results_status", "Save cancelled"),
@@ -428,6 +430,7 @@ class TrackingTab:
                 tag="track_load_results_file_dialog",
                 label="Load tracking results",
                 directory_selector=False,
+                default_path=default_files_dir(),
                 show=False,
                 callback=self.on_track_load_results_file_selected,
                 cancel_callback=lambda s, a: dpg.set_value("track_load_results_status", "Load cancelled"),

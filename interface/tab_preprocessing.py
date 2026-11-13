@@ -10,6 +10,7 @@ from config.constants import (
     PSEUDOFAME_DIMENSIONS,
     SUPPORTED_FORMATS,
 )
+from utils.paths import default_files_dir
 from utils.dataloader import build_preview_and_stats, load_data_file
 from utils.helpers import EventDataHelper
 from utils.plots import (
@@ -251,6 +252,7 @@ class PreprocessingTab:
                 tag="save_filtered_file_dialog",
                 label="Save filtered events",
                 directory_selector=False,
+                default_path=default_files_dir(),
                 show=False,
                 callback=self.on_save_filtered_file_selected,
                 cancel_callback=lambda s, a: dpg.set_value("save_filtered_status", "Save cancelled"),
@@ -266,15 +268,16 @@ class PreprocessingTab:
                 tag="data_file_dialog",
                 label="Select event-stream file",
                 directory_selector=False,
+                default_path=default_files_dir(),
                 show=False,
                 callback=self.on_data_file_selected,
                 cancel_callback=self.on_data_file_cancelled,
                 width=800,
                 height=500,
             ):
+                dpg.add_file_extension(".raw", color=(150, 255, 150, 255))  # first: selected by default
                 dpg.add_file_extension(".npz", color=(150, 255, 150, 255))
                 dpg.add_file_extension(".mat", color=(150, 255, 150, 255))
-                dpg.add_file_extension(".raw", color=(150, 255, 150, 255))
 
     def _build_preprocessing_parameters_panel(self) -> None:
         try:
@@ -299,11 +302,6 @@ class PreprocessingTab:
     # File handling
     # ------------------------------------------------------------------
     def browse_data_file(self, sender=None, app_data=None, user_data=None):
-        data_dir = Path(__file__).parent.parent.parent.parent / "data"
-        if data_dir.exists():
-            if dpg.does_item_exist("data_file_dialog"):
-                dpg.configure_item("data_file_dialog", default_path=str(data_dir.resolve()))
-    
         dpg.show_item("data_file_dialog")
     
     def on_data_file_cancelled(self, sender, app_data):

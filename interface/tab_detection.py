@@ -10,6 +10,7 @@ import scipy.io as sio
 from pathlib import Path
 import math
 import matplotlib.pyplot as plt
+from utils.paths import default_files_dir
 from utils.plots import figure_to_rgba_flat
 from utils.raster import binary_rgba, draw_dots, scalar_rgba
 from utils.packed_tracks import PackedTracks
@@ -616,6 +617,7 @@ class DetectionTab:
                 tag="det_save_results_file_dialog",
                 label="Save detection results",
                 directory_selector=False,
+                default_path=default_files_dir(),
                 show=False,
                 callback=self.on_det_save_results_file_selected,
                 cancel_callback=lambda s, a: dpg.set_value("det_save_results_status", "Save cancelled"),
@@ -630,6 +632,7 @@ class DetectionTab:
                 tag="det_load_results_file_dialog",
                 label="Load detection results",
                 directory_selector=False,
+                default_path=default_files_dir(),
                 show=False,
                 callback=self.on_det_load_results_file_selected,
                 cancel_callback=lambda s, a: dpg.set_value("det_load_results_status", "Load cancelled"),
