@@ -14,7 +14,7 @@ class LoadedData:
     data: Any
     status_message: str
 
-    width: Optional[int] = None
+    width: Optional[int] = None  # sensor size found in the file (None: not given)
     height: Optional[int] = None
 
 def _load_events_with_metavision(
@@ -23,6 +23,8 @@ def _load_events_with_metavision(
     # Numba EVT 3.0 decoder, identical events to pyEBIV.loadRaw() + time()/x()/y()/p()
     # but ~10x faster and without converting 100 M events through Python lists.
     raw = load_raw(file_path, t_dtype=np.float64)  # times decoded as float64 (exact): no conversion pass
+    if not raw.geometry_found:  # (decoded with the loader's 1280 x 720 fallback)
+        return raw.x, raw.y, raw.t, raw.p, None, None
     return raw.x, raw.y, raw.t, raw.p, raw.width, raw.height
 
 
@@ -66,6 +68,14 @@ def load_data_file(file_path: str) -> LoadedData:
         status = f"Valid {file_ext} file. Size: {size_mb:.2f} MB"
     else:
         status = f"Unknown format: {file_ext}"
+
+    if width is None and isinstance(data, dict):  # .npz / .mat saved with the sensor size (e.g. by STELLA)
+        try:
+            w, h = int(np.ravel(data["width"])[0]), int(np.ravel(data["height"])[0])
+            if w > 0 and h > 0:
+                width, height = w, h
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
 
     return LoadedData(
         file_path=file_path,

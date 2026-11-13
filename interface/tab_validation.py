@@ -321,6 +321,8 @@ class ValidationTab:
             with dpg.draw_node(tag=self._pf_tracks_node_tag):
                 pass
         self._view_zoom.register(self._pf_drawlist_tag, self._apply_view_zoom)
+        if self.preprocessing_tab is not None:
+            self.preprocessing_tab.register_geometry_listener(self._on_geometry)
 
         dpg.add_text("Load data in Preprocessing to generate pseudo-frame.", tag=self._pf_status_tag, wrap=1200)
 
@@ -428,16 +430,27 @@ class ValidationTab:
         self.params["track_timefactor"] = v
         self._update_validation_overlay()
 
+    def _on_geometry(self, width, height, display_w, display_h) -> None:
+        """Sensor size from Preprocessing: the view takes the sensor aspect ratio, the track lines (drawn in sensor
+        pixels) are scaled to it."""
+        self._geometry = (int(width), int(height), int(display_w), int(display_h))
+        if dpg.does_item_exist(self._pf_drawlist_tag):
+            dpg.configure_item(self._pf_drawlist_tag, width=display_w, height=display_h)
+        if dpg.does_item_exist(self._pf_drawimage_tag):
+            dpg.configure_item(self._pf_drawimage_tag, pmax=[display_w, display_h])
+        self._apply_view_zoom()
+
     def _apply_view_zoom(self, uv_min=None, uv_max=None) -> None:
-        """Shows the shared zoom region: image texture coordinates, and the track lines (drawn in whole-frame
-        coordinates) transformed to match."""
+        """Shows the shared zoom region: image texture coordinates, and the track lines (drawn in sensor pixels)
+        scaled to the view and transformed to match."""
         uv_min = self._view_zoom.uv_min if uv_min is None else uv_min
         uv_max = self._view_zoom.uv_max if uv_max is None else uv_max
         if dpg.does_item_exist(self._pf_drawimage_tag):
             dpg.configure_item(self._pf_drawimage_tag, uv_min=uv_min, uv_max=uv_max)
         if dpg.does_item_exist(self._pf_tracks_node_tag):
-            w, h = self.pseudoframe_dimensions
-            dpg.apply_transform(self._pf_tracks_node_tag, overlay_transform(uv_min, uv_max, w, h))
+            sw, sh, dw, dh = getattr(self, "_geometry", (*self.pseudoframe_dimensions, *self.pseudoframe_dimensions))
+            dpg.apply_transform(self._pf_tracks_node_tag, overlay_transform(uv_min, uv_max, dw, dh)
+                                * dpg.create_scale_matrix([dw / sw, dh / sh, 1.0]))
 
     def sync_pseudoframe_overlay(self) -> None:
         """Redraws the track overlay when the displayed frame (shared by all pages), the accumulation time or the

@@ -20,6 +20,7 @@ Same conventions as pyEBIV:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,10 +41,25 @@ class RawEvents:
     width: int
     height: int
     time_stamp: int    # absolute time of the first event (us)
+    geometry_found: bool = True  # False: the header gave no sensor size (width, height = 1280 x 720)
 
 
-def _read_header(f) -> tuple[int, int, bool, int]:
-    """Parses the '%' header lines. Returns (width, height, is_evt3, data offset)."""
+def _parse_geometry(key: str, val: str):
+    """(width, height) from a 'geometry WxH' or 'format EVT3;height=H;width=W' header field, else None."""
+    if key == "geometry":
+        m = re.fullmatch(r"(\d+)x(\d+)", val)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    elif key == "format":
+        opts = dict(kv.split("=", 1) for kv in val.split(";")[1:] if "=" in kv)
+        if opts.get("width", "").isdigit() and opts.get("height", "").isdigit():
+            return int(opts["width"]), int(opts["height"])
+    return None
+
+
+def _read_header(f) -> tuple[int, int, bool, int, bool]:
+    """Parses the '%' header lines. Returns (width, height, is_evt3, data offset, geometry found in the file);
+    without geometry the size is 1280 x 720."""
     width = height = 0
     integrator = plugin = ""
     is_evt3 = False
@@ -66,11 +82,12 @@ def _read_header(f) -> tuple[int, int, bool, int]:
                 plugin = val
             elif key == "generation" and val == "4.2":
                 is_evt3 = True
-            elif key == "geometry":
-                if val == "640x480":
-                    width, height, have_geometry = 640, 480, True
-                elif val == "1280x720":
-                    width, height, have_geometry = 1280, 720, True
+            elif key in ("geometry", "format"):
+                if key == "format" and val.split(";")[0] == "EVT3":
+                    is_evt3 = True
+                geometry = _parse_geometry(key, val)
+                if geometry is not None and (key == "geometry" or not have_geometry):
+                    (width, height), have_geometry = geometry, True
         if line == "% evt 3.0":
             is_evt3 = True
     if integrator == "Prophesee" and plugin in ("hal_plugin_gen41_evk2", "hal_plugin_imx636_evk4"):
@@ -81,7 +98,7 @@ def _read_header(f) -> tuple[int, int, bool, int]:
         width, height, have_geometry = 1280, 720, True
     if not have_geometry:
         width, height = 1280, 720
-    return width, height, is_evt3, f.tell()
+    return width, height, is_evt3, f.tell(), have_geometry
 
 
 MAX_TIMESTAMP_BASE = ((1 << 12) - 1) << 12
@@ -341,11 +358,11 @@ def _decode(words, width, height, max_events, t_dtype=np.int64):
 def load_raw(file_path: str, max_events: int = 700_000_000, t_dtype=np.int64) -> RawEvents:
     """Events of an EVT 3.0 .raw file; t_dtype: dtype of the times (exact integers in float64 too)."""
     with open(file_path, "rb") as f:
-        width, height, is_evt3, offset = _read_header(f)
+        width, height, is_evt3, offset, geometry_found = _read_header(f)
     if not is_evt3:
         raise ValueError(f"not an EVT 3.0 event data file: {file_path}")
     size = os.path.getsize(file_path) - offset
     words = np.memmap(file_path, dtype="<u2", mode="r", offset=offset, shape=(size // 2,))
     xs, ys, ts, ps, time_stamp = _decode(words, width, height, max_events, t_dtype)
     del words
-    return RawEvents(xs, ys, ts, ps, width, height, time_stamp)
+    return RawEvents(xs, ys, ts, ps, width, height, time_stamp, geometry_found)

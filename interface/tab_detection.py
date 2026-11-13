@@ -12,7 +12,7 @@ import math
 import matplotlib.pyplot as plt
 from utils.paths import default_files_dir
 from utils.plots import figure_to_rgba_flat
-from utils.raster import binary_rgba, draw_dots, scalar_rgba
+from utils.raster import binary_rgba, draw_dots, resample_nearest, scalar_rgba
 from utils.packed_tracks import PackedTracks
 from utils import parallel
 from interface.view_zoom import SharedZoom
@@ -749,6 +749,17 @@ class DetectionTab:
             "det_cluster_plot_image", uv_min=uv_min, uv_max=uv_max))
         if self.preprocessing_tab is not None:  # time label follows the displayed frame, like the pseudo-frame's
             self.preprocessing_tab.register_pseudoframe_mirror(status_tag="", time_info_tag="det_cluster_time_info")
+            self.preprocessing_tab.register_geometry_listener(self._on_geometry)
+
+    def _on_geometry(self, width, height, display_w, display_h):
+        """Sensor size from Preprocessing (file, typed or default): detection runs and views use it."""
+        self.params["width"], self.params["height"] = int(width), int(height)
+        if dpg.does_item_exist("det_pf_drawlist"):
+            dpg.configure_item("det_pf_drawlist", width=display_w, height=display_h)
+        if dpg.does_item_exist("det_pf_drawimage"):
+            dpg.configure_item("det_pf_drawimage", pmax=[display_w, display_h])
+        if dpg.does_item_exist("det_cluster_plot_image"):
+            dpg.configure_item("det_cluster_plot_image", width=display_w, height=display_h)
         
     def _build_duration_hist_panel(self):
         with dpg.child_window(
@@ -915,7 +926,7 @@ class DetectionTab:
                     dropped=self._dropped_clusters(out),
                 )
                 
-                W, H = 1280, 720
+                W, H = self.pseudoframe_dimensions
                 self._ensure_cluster_texture_size(W, H)
                 self._set_cluster_texture(I, W, H)
                 
@@ -1005,7 +1016,7 @@ class DetectionTab:
                     dropped=self._dropped_clusters(out),
                 )
                 
-                W, H = 1280, 720
+                W, H = self.pseudoframe_dimensions
                 self._ensure_cluster_texture_size(W, H)
                 self._set_cluster_texture(I, W, H)
                 
@@ -1286,12 +1297,12 @@ class DetectionTab:
         # same picture as pcolor(I, cmap="viridis"): row 0 at the bottom, colours scaled to [min, max]
         I = np.asarray(I)
         rgba = np.zeros((H, W, 4), np.float32)
-        img = scalar_rgba(I[::-1])
+        img = resample_nearest(scalar_rgba(I[::-1]), H, W)  # sensor-sized image onto the texture
         h, w = min(H, img.shape[0]), min(W, img.shape[1])
         rgba[:h, :w] = img[:h, :w]
         grey = self._cluster_grey_mask
         if grey is not None and grey.shape == I.shape:  # clusters a full run would discard (test-run preview)
-            rgba[:h, :w][grey[::-1][:h, :w]] = (0.55, 0.55, 0.55, 1.0)
+            rgba[:h, :w][resample_nearest(grey[::-1], H, W)[:h, :w]] = (0.55, 0.55, 0.55, 1.0)
         dpg.set_value(self.cluster_texture_tag, rgba.ravel())
 
     def _clusters_in_window(self, t_clust, T_min, T_max):
@@ -1468,7 +1479,7 @@ class DetectionTab:
         X = X_all[lo:hi].astype(np.int64)
         Y = Y_all[lo:hi].astype(np.int64)
     
-        W, H = self.pseudoframe_dimensions  
+        W, H = int(self.params["width"]), int(self.params["height"])  # sensor size
         valid = (X >= 0) & (X < W) & (Y >= 0) & (Y < H)
         X, Y = X[valid], Y[valid]
         
@@ -1491,7 +1502,8 @@ class DetectionTab:
             if len(xs) > 0:
                 draw_dots(rgba, xs, ys, radius=2.0, rgb=(1.0, 0.0, 0.0), alpha=0.8)
 
-        dpg.set_value(self._overlay_pseudoframe_texture_tag, rgba.ravel())
+        tw, th = self.pseudoframe_dimensions  # the overlay texture has the pseudo-frame texture size
+        dpg.set_value(self._overlay_pseudoframe_texture_tag, resample_nearest(rgba, th, tw).ravel())
 
         dpg.configure_item("det_pf_drawimage", texture_tag=self._overlay_pseudoframe_texture_tag)
         
@@ -1745,7 +1757,7 @@ class DetectionTab:
                     dropped=self._dropped_clusters(out),
                 )
     
-            W, H = 1280, 720
+            W, H = self.pseudoframe_dimensions
             self._ensure_cluster_texture_size(W, H)
             self._set_cluster_texture(I, W, H)
     

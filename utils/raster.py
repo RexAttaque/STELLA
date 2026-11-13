@@ -66,3 +66,14 @@ def draw_dots(rgba: np.ndarray, xs, ys, radius: float = 2.0, rgb=(1.0, 0.0, 0.0)
     flat = np.unique(py * w + px)          # each pixel blended once even where discs overlap
     view = rgba.reshape(-1, 4)
     view[flat, :3] = view[flat, :3] * (1.0 - alpha) + np.asarray(rgb, np.float32) * alpha
+
+
+def resample_nearest(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Nearest-neighbour resampling of the first two axes to (out_h, out_w): a sensor-sized image onto a fixed-size
+    texture (same sampling as the pseudo-frame)."""
+    src_h, src_w = img.shape[:2]
+    if (src_h, src_w) == (out_h, out_w):
+        return img
+    yi = np.linspace(0, src_h - 1, out_h).astype(np.int32)
+    xi = np.linspace(0, src_w - 1, out_w).astype(np.int32)
+    return img[yi][:, xi]

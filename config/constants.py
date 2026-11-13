@@ -22,7 +22,7 @@ DEFAULT_PARAMS: Dict[str, float | int | bool] = {
     "steps_rev": 10000,
     "overlap": 0.4,
     "multitimefactor": 2,
-    "use_only_pos": True,
+    "polarity": "ON only",  # events used: one of POLARITY_OPTIONS
     "live_view": False,
     "find_simple": False,
     "pixelwise_extension": True,
@@ -38,6 +38,11 @@ DEFAULT_PARAMS: Dict[str, float | int | bool] = {
     "chopperwheel": False,
     "multirun": False,
 }
+
+POLARITY_OPTIONS: Sequence[str] = ("ON only", "OFF only", "ON and OFF")
+
+# sensor size used when a file does not give it
+DEFAULT_SENSOR_SIZE: Tuple[int, int] = (1280, 720)
 
 SUPPORTED_FORMATS: Sequence[str] = (
     ".npz",

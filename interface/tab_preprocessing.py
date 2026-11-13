@@ -7,6 +7,8 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 from interface.view_zoom import SharedZoom
 from config.constants import (
+    DEFAULT_SENSOR_SIZE,
+    POLARITY_OPTIONS,
     DEFAULT_PARAMS,
     PSEUDOFAME_DIMENSIONS,
     SUPPORTED_FORMATS,
@@ -57,6 +59,7 @@ class PreprocessingTab:
         self.supported_formats: Sequence[str] = SUPPORTED_FORMATS
         self.pseudoframe_texture_tag: str = "preprocessing_pseudoframe_texture"
         self.pseudoframe_dimensions = PSEUDOFAME_DIMENSIONS
+        self._geometry_listeners = []  # called with (sensor w, h, display w, h) when the sensor size changes
         self.last_loaded_data: Any = None
         self.display_t0: float | None = None
         self.raw_events: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]] = None
@@ -156,6 +159,23 @@ class PreprocessingTab:
             min_clamped=True,
             callback=self.update_preprocessing_accumulation_time,
         )
+        dpg.add_text("Events used:", color=(200, 200, 100))
+        dpg.add_combo(
+            items=list(POLARITY_OPTIONS),
+            default_value=str(self.params.get("polarity", POLARITY_OPTIONS[0])),
+            width=150,
+            tag="preprocessing_polarity",
+            callback=self.on_polarity_change,
+        )
+        dpg.add_text("Sensor size:", color=(200, 200, 100))
+        w0, h0 = self.sensor_size()
+        with dpg.group(horizontal=True):
+            dpg.add_input_int(label="width", tag="bracket_preprocessing_width", default_value=w0, width=120,
+                              min_value=1, min_clamped=True, on_enter=True, callback=self.on_sensor_size_typed)
+            dpg.add_input_int(label="height", tag="bracket_preprocessing_height", default_value=h0, width=120,
+                              min_value=1, min_clamped=True, on_enter=True, callback=self.on_sensor_size_typed)
+        dpg.add_text("Read from the file when it gives it (Enter to apply a typed value).",
+                     tag="preprocessing_sensor_size_status", wrap=430, color=(180, 180, 180))
         dpg.add_text("ROI:", color=(200, 200, 100))
         with dpg.group(horizontal=True):
             dpg.add_input_int(
@@ -289,6 +309,8 @@ class PreprocessingTab:
         dpg.add_image(self.pseudoframe_texture_tag, width=self.pseudoframe_dimensions[0], height=self.pseudoframe_dimensions[1], tag="preprocessing_pseudoframe_image")
         self.view_zoom.register("preprocessing_pseudoframe_image", lambda uv_min, uv_max: dpg.configure_item(
             "preprocessing_pseudoframe_image", uv_min=uv_min, uv_max=uv_max))
+        self.register_geometry_listener(lambda w, h, dw, dh: dpg.configure_item(
+            "preprocessing_pseudoframe_image", width=dw, height=dh))
         dpg.add_text("Load data to generate pseudo-frame.", tag="preprocessing_pseudoframe_status", wrap=730)
         
         with dpg.group(horizontal=True):
@@ -345,10 +367,13 @@ class PreprocessingTab:
             self.log_status(f"Loading file: {self.data_file}")
             loaded = load_data_file(self.data_file)
 
-            if loaded.width is not None:
-                self.params["width"] = loaded.width
-            if loaded.height is not None:
-                self.params["height"] = loaded.height
+            if loaded.width is not None and loaded.height is not None:
+                self._set_sensor_size(loaded.width, loaded.height,
+                                      f"{loaded.width} x {loaded.height} read from the file.", warn=False)
+            else:
+                w, h = DEFAULT_SENSOR_SIZE
+                self._set_sensor_size(w, h, f"The file gives no sensor size: {w} x {h} assumed. "
+                                            "Enter the right size if it differs.", warn=True)
 
             self.last_loaded_data = loaded.data
             self.last_loaded_file_ext = loaded.file_ext
@@ -459,8 +484,9 @@ class PreprocessingTab:
                 _and(Y >= ymin)
             if Y.max() > ymax:
                 _and(Y <= ymax)
-        if self.params.get("use_only_pos", True) and P is not None:
-            _and(P > 0)
+        polarity = self.params.get("polarity", POLARITY_OPTIONS[0])
+        if P is not None and polarity != "ON and OFF":
+            _and(P > 0 if polarity == "ON only" else P <= 0)
 
         if mask is not None:
             X, Y, T = X[mask], Y[mask], T[mask]
@@ -472,6 +498,61 @@ class PreprocessingTab:
         Pf = P
         self.filtered_events = (Xf, Yf, Tf, Pf)
         self.log_status(f"Filters applied: kept {Xf.size} / {len(xs)} events")
+
+    # ------------------------------------------------------------------
+    # Sensor size and polarity
+    # ------------------------------------------------------------------
+    def sensor_size(self) -> tuple[int, int]:
+        """(width, height) of the sensor in pixels: read from the file, typed by the user, or the default."""
+        return int(self.params.get("width", DEFAULT_SENSOR_SIZE[0])), int(self.params.get("height", DEFAULT_SENSOR_SIZE[1]))
+
+    def display_size(self) -> tuple[int, int]:
+        """Size of the sensor views: the sensor aspect ratio, fitted in the pseudo-frame area."""
+        w, h = self.sensor_size()
+        bw, bh = self.pseudoframe_dimensions
+        scale = min(bw / w, bh / h)
+        return max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+
+    def register_geometry_listener(self, callback) -> None:
+        """`callback(sensor_w, sensor_h, display_w, display_h)`, now and whenever the sensor size changes."""
+        self._geometry_listeners.append(callback)
+        callback(*self.sensor_size(), *self.display_size())
+
+    def _set_sensor_size(self, width: int, height: int, message: str, warn: bool = False) -> None:
+        self.params["width"], self.params["height"] = int(width), int(height)
+        for tag, v in (("bracket_preprocessing_width", width), ("bracket_preprocessing_height", height)):
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, int(v))
+        if dpg.does_item_exist("preprocessing_sensor_size_status"):
+            dpg.set_value("preprocessing_sensor_size_status", message)
+            dpg.configure_item("preprocessing_sensor_size_status",
+                               color=(255, 170, 80) if warn else (100, 255, 100))
+        self.log_status(f"Sensor size: {message}")
+        dims = (*self.sensor_size(), *self.display_size())
+        for callback in self._geometry_listeners:
+            try:
+                callback(*dims)
+            except Exception as e:  # one view must not stop the others
+                self.log_status(f"View resize failed: {e}")
+        self.update_preprocessing_parameters_display()
+
+    def on_sensor_size_typed(self, sender=None, app_data=None, user_data=None) -> None:
+        w = int(dpg.get_value("bracket_preprocessing_width"))
+        h = int(dpg.get_value("bracket_preprocessing_height"))
+        if (w, h) == self.sensor_size():
+            return
+        self._set_sensor_size(w, h, f"{w} x {h} entered.", warn=False)
+        if getattr(self, "raw_events", None):
+            self.apply_event_filters()
+            self.update_pseudoframe_from_data("Sensor size changed.")
+
+    def on_polarity_change(self, sender=None, app_data=None, user_data=None) -> None:
+        self.params["polarity"] = str(app_data)
+        self.log_status(f"Events used: {app_data}")
+        self.update_preprocessing_parameters_display()
+        if getattr(self, "raw_events", None):
+            self.apply_event_filters()
+            self.update_pseudoframe_from_data("Polarity changed.")
 
     def update_roi_param(self, sender, app_data, user_data):
         self.params[user_data] = int(app_data)
@@ -532,12 +613,12 @@ class PreprocessingTab:
         if not dpg.does_item_exist("preprocessing_parameters_display"):
             return
         params_text = "Current Settings:\n"
-        params_text += f"  Width: {self.params.get('width', 720)}\n"
-        params_text += f"  Height: {self.params.get('height', 1280)}\n"
+        w, h = self.sensor_size()
+        params_text += f"  Sensor: {w} x {h}\n"
         acc = self.params.get("accumulation_time_ms", None)
         if acc is not None and acc != "":
             params_text += f"  Accumulation Time: {acc} ms\n"
-        params_text += f"  Use Only Positive: {self.params.get('use_only_pos', True)}\n"
+        params_text += f"  Events used: {self.params.get('polarity', POLARITY_OPTIONS[0])}\n"
         dpg.set_value("preprocessing_parameters_display", params_text)
 
     # ------------------------------------------------------------------
@@ -619,8 +700,7 @@ class PreprocessingTab:
                 self.update_pseudoframe_visualization(None, "Pseudo-frame preview unavailable (empty coordinates).")
                 self.log_status("Cannot generate pseudo-frame: empty coordinate arrays")
                 return
-            width = 1280
-            height = 720
+            width, height = self.sensor_size()
             
             ts_arr, xs_arr, ys_arr = ts, xs, ys  # time sorted and finite (see _time_sorted)
 
