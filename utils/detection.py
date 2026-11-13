@@ -27,6 +27,11 @@ try:
 except NameError:
     structure_size = 1
 
+# A cluster is kept only if it was followed over at least min_steps time steps and holds at least min_events events.
+# During the run, a cluster younger than min_steps that was not extended for 2 steps is retired (its slot reused).
+min_steps = max(1, int(globals().get("min_steps", 3)))
+min_events = max(1, int(globals().get("min_events", 20)))
+
 structure_size = max(1, int(structure_size))
 structure = np.ones((structure_size, structure_size), dtype=bool)
 
@@ -175,7 +180,7 @@ for multi in range(multiN):
             if _tracker is None:  # takes over the clusters started at step 0
                 _tracker = PixelwiseTracker(height, width, structure, multi == 1, buffer, len(X_global),
                                             steps, inactive, inactive_k, valid, x_m, y_m, t_m,
-                                            active_pixels, ind_clust)
+                                            active_pixels, ind_clust, min_steps=min_steps)
             _tracker.step(k, xs, ys, _order, _off, X, Y, T, ind_global)
         elif k == 0:
             if pseudo_images:
@@ -755,7 +760,7 @@ for multi in range(multiN):
     
             # (the former L_before bookkeeping here was never read)
             _n = int(max_tracks)
-            inactive[:_n][(steps[:_n] < buffer) & (steps[:_n] < 3) & ((inactive_k[:_n] + 2) < k)] = 1
+            inactive[:_n][(steps[:_n] < buffer) & (steps[:_n] < min_steps) & ((inactive_k[:_n] + 2) < k)] = 1
 
         del_[:] = 1
         
@@ -790,7 +795,7 @@ for multi in range(multiN):
         n_events = [] if isinstance(ind_clust, PackedTracks) else [len(a) for a in ind_clust]
         if lightweight_mode or pseudo_images:
             for i in range(len(ind_clust)):
-                if n_events[i]<20:
+                if n_events[i]<min_events:
                     x_clust[i] = np.array([], dtype=int)
                     y_clust[i] = np.array([], dtype=int)
                     t_clust[i] = np.array([], dtype=int)
@@ -799,11 +804,11 @@ for multi in range(multiN):
                     y_m[i] = np.array([])
                     t_m[i] = np.array([])
         elif isinstance(ind_clust, PackedTracks):
-            _keep = ind_clust.lengths() >= 20
+            _keep = ind_clust.lengths() >= min_events
             x_clust, y_clust, t_clust, ind_clust = (c.keep(_keep) for c in (x_clust, y_clust, t_clust, ind_clust))
         else:
             for i in range(len(ind_clust)):
-                if n_events[i]<20:
+                if n_events[i]<min_events:
                     x_clust[i] = np.array([], dtype=int)
                     y_clust[i] = np.array([], dtype=int)
                     t_clust[i] = np.array([], dtype=int)
@@ -813,13 +818,13 @@ for multi in range(multiN):
         if lightweight_mode == False:
             if isinstance(x_clust, PackedTracks):
                 if not test_mode:
-                    _keep = ~((steps[:len(x_clust)] < 3) | (x_clust.lengths() < 20))
+                    _keep = ~((steps[:len(x_clust)] < min_steps) | (x_clust.lengths() < min_events))
                     x_clust, y_clust, t_clust, ind_clust = (c.keep(_keep) for c in (x_clust, y_clust, t_clust, ind_clust))
             else:
                 n_events = [len(a) for a in x_clust]
                 if not test_mode:
                     for i in range(len(ind_clust)):
-                        if steps[i] < 3 or n_events[i]<20:
+                        if steps[i] < min_steps or n_events[i]<min_events:
                             x_clust[i] = np.array([], dtype=int)
                             y_clust[i] = np.array([], dtype=int)
                             t_clust[i] = np.array([], dtype=int)
@@ -872,7 +877,7 @@ for multi in range(multiN):
             n_events = [len(a) for a in ind_clust]
             if not test_mode:
                 for i in range(len(ind_clust)):
-                    if len(x_m[i]) < 3 or n_events[i]<40:
+                    if len(x_m[i]) < min_steps or n_events[i]<2 * min_events:  # (twice the minimum, as before)
                         x_clust[i] = np.array([], dtype=int)
                         y_clust[i] = np.array([], dtype=int)
                         t_clust[i] = np.array([], dtype=int)

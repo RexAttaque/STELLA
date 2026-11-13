@@ -583,9 +583,10 @@ def _create(k, newlabs, nn, order, off, xs, ys, Xw, Yw, Tw, indw, heap, heap_n,
 
 @njit(cache=True, nogil=True)
 def _release(k, thresh, cand, cand_n, steps, inactive, inactive_k, heap, heap_n):
-    """inactive[(steps < buffer) & (steps < 3) & (inactive_k + 2 < k)] = 1, over the only slots it can change.
+    """inactive[(steps < buffer) & (steps < min_steps) & (inactive_k + 2 < k)] = 1, over the only slots it can
+    change (thresh = min(buffer, min_steps)).
 
-    `cand` holds every slot with inactive == 0 and steps < min(buffer, 3): slots enter it when they start a
+    `cand` holds every slot with inactive == 0 and steps < thresh: slots enter it when they start a
     cluster and never come back until they start another one.
     """
     w = 0
@@ -672,7 +673,7 @@ class PixelwiseTracker:
     """
 
     def __init__(self, height, width, structure, second_pass, buffer, n_global,
-                 steps, inactive, inactive_k, valid, x_m, y_m, t_m, active_pixels, ind_clust):
+                 steps, inactive, inactive_k, valid, x_m, y_m, t_m, active_pixels, ind_clust, min_steps=3):
         n = len(steps)
         self.n = n
         self.cap = n
@@ -711,7 +712,7 @@ class PixelwiseTracker:
         self.ap_off[filled] = np.cumsum(ap_lens) - ap_lens
 
         self.vlist = np.flatnonzero(np.asarray(valid) != 0).astype(np.int64)
-        self.thresh = float(min(3, buffer))
+        self.thresh = float(min(min_steps, buffer))
         self.cand = np.zeros(n, np.int64)
         c = np.flatnonzero((self.inactive == 0) & (self.steps < self.thresh))
         self.cand[:c.size] = c

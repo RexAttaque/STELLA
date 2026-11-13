@@ -98,6 +98,8 @@ class DetectionTab:
         self.params.setdefault("N_pixelwise", 5)
         self.params.setdefault("overlap", 0.4)
         self.params.setdefault("structure_size", 1)
+        self.params.setdefault("min_steps", 3)    # a kept cluster spans at least this many time steps
+        self.params.setdefault("min_events", 20)  # and holds at least this many events
         
         self.params.setdefault("epsilon", 7.5)  
         self.params.setdefault("minPts", 20)    
@@ -449,6 +451,46 @@ class DetectionTab:
         )
 
         with dpg.group(horizontal=True):
+            dpg.add_input_int(
+                label="min. time steps per cluster",
+                default_value=int(self.params.get("min_steps", 3)),
+                min_value=1,
+                min_clamped=True,
+                width=150,
+                callback=lambda s, a, u: self.params.__setitem__("min_steps", int(a)),
+                tag="det_input_min_steps",
+            )
+            dpg.add_button(label="?", width=22, height=22, tag="min_steps_info_btn")
+            dpg.bind_item_theme("min_steps_info_btn", info_button_theme)
+            with dpg.popup("min_steps_info_btn", mousebutton=dpg.mvMouseButton_Left):
+                dpg.add_text(
+                    "A full run keeps a cluster only if it was followed\n"
+                    "over at least this many consecutive time steps.\n"
+                    "Shorter-lived clusters are discarded during the run.\n\n"
+                    "Fast objects crossing the view in few steps need a\n"
+                    "lower value (or a shorter accumulation time).\n"
+                    "The test run (one step) shows which clusters a full\n"
+                    "run would discard."
+                )
+        with dpg.group(horizontal=True):
+            dpg.add_input_int(
+                label="min. events per cluster",
+                default_value=int(self.params.get("min_events", 20)),
+                min_value=1,
+                min_clamped=True,
+                width=150,
+                callback=lambda s, a, u: self.params.__setitem__("min_events", int(a)),
+                tag="det_input_min_events",
+            )
+            dpg.add_button(label="?", width=22, height=22, tag="min_events_info_btn")
+            dpg.bind_item_theme("min_events_info_btn", info_button_theme)
+            with dpg.popup("min_events_info_btn", mousebutton=dpg.mvMouseButton_Left):
+                dpg.add_text(
+                    "A full run keeps a cluster only if it holds at least\n"
+                    "this many events in total (over all its time steps)."
+                )
+
+        with dpg.group(horizontal=True):
             dpg.add_checkbox(
                 label="enable multirun",
                 default_value=bool(self.params.get("multirun", False)),
@@ -772,6 +814,8 @@ class DetectionTab:
             "multiN": multiN,
             "overlap": float(self.params.get("overlap", 0.4)),
             "structure_size": int(self.params.get("structure_size", 1)),
+            "min_steps": int(self.params.get("min_steps", 3)),
+            "min_events": int(self.params.get("min_events", 20)),
     
             "height": self.params["width"],
             "width": self.params["height"],
@@ -1944,6 +1988,8 @@ class DetectionTab:
             "N",
             "overlap",
             "structure_size",
+            "min_steps",
+            "min_events",
             "threshold",
             "min_cluster_size",
             "max_cluster_size",
@@ -2027,6 +2073,16 @@ class DetectionTab:
             except Exception:
                 pass
             
+        for key, tag in (("min_steps", "det_input_min_steps"), ("min_events", "det_input_min_events")):
+            if key in ctx_params:
+                try:
+                    v = int(ctx_params[key])
+                    self.params[key] = v
+                    if dpg.does_item_exist(tag):
+                        dpg.set_value(tag, v)
+                except Exception:
+                    pass
+
         if "structure_size" in ctx_params and dpg.does_item_exist("det_input_pixelwise_structure_size"):
             try:
                 v = int(ctx_params["structure_size"])
