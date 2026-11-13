@@ -1007,13 +1007,25 @@ class DetectionTab:
             dpg.configure_item("det_stop_button", enabled=False)  # no run started: nothing to stop
             return
 
+        timeline = self.preprocessing_tab.timeline
+        n_steps, dt_run = int(ctx["N"]), float(ctx["dt"])
+        timeline.progress("detection", time_range[0], time_range[0], time_range[1],
+                          text=f"Detection 0 %: step 0 of {n_steps}")
+
+        def progress(done_range):
+            k = int(round((done_range[1] - done_range[0]) / dt_run))
+            text = (f"Detection {100 * k / max(n_steps, 1):.0f} %: step {k} of {n_steps}" if k < n_steps
+                    else "Detection: all steps done, finishing (track repair)")
+            timeline.progress("detection", done_range[0], done_range[1], time_range[1], text=text)
+
         def worker():
             stdout_writer = QueueWriter(self._log_queue)
             stderr_writer = QueueWriter(self._log_queue)
-        
+
             try:
                 with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
-                    out = self.engine.run(ctx)
+                    # (the callback goes to the engine only: the saved run parameters stay plain values)
+                    out = self.engine.run(dict(ctx, progress=progress))
                     self.last_result = out
                 r = getattr(out, "time_range", None)
                 if r is not None and r[1] < time_range[1] - 1e-6:
@@ -1060,6 +1072,7 @@ class DetectionTab:
             except Exception as e:
                 self._log_queue.put(f"[DETECTION] ERROR: {e}")
             finally:
+                timeline.progress_end("detection")
                 self._log_queue.put("__DONE__")
     
         self._run_thread = threading.Thread(target=worker, daemon=True)

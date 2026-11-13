@@ -51,6 +51,7 @@ structure = np.ones((structure_size, structure_size), dtype=bool)
 
 # %% init
 stop_event = globals().get("stop_event", None)
+_progress = globals().get("progress", None)  # optional callable(time_range) after every step (GUI progress bar)
 x_clust = [[] for _ in range(max_tracks)]
 y_clust = [[] for _ in range(max_tracks)]
 t_clust = [[] for _ in range(max_tracks)]
@@ -794,6 +795,8 @@ for multi in range(multiN):
             print(f"Loop {k} completed in {tic_end - tic_start} seconds")
         if multi == 0:
             time_range = (float(T_min), float(T_min + (k + 1) * dt))
+            if _progress is not None:
+                _progress(time_range)
         if stop_event is not None and stop_event.is_set():
             break
 

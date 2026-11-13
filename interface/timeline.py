@@ -31,6 +31,8 @@ COL_DATA = (60, 120, 220, 255)
 COL_DETECTION = (60, 190, 90, 255)
 COL_TRACKING = (225, 60, 60, 255)
 COL_TRACKING_OLD = (120, 55, 55, 255)
+COL_TRACKING_WORK = (225, 60, 60, 150)  # batch being tracked
+COL_PROGRESS_TEXT = (255, 200, 80)
 COL_RANGE = (255, 210, 80, 255)
 COL_HANDLE = (245, 245, 245, 255)
 
@@ -78,6 +80,10 @@ class Timeline:
         self._input_items: dict[int, bool] = {}
         self._range_listeners: list[Callable[[], None]] = []
         self._text_sig = None
+        # runs in progress (set from their threads): (start, done until, planned end, being processed until, text)
+        self.live: dict[str, Optional[tuple]] = {"detection": None, "tracking": None}
+        self._progress_texts: list[str] = []
+        self._progress_sig = None
 
     def attach(self, detection_tab=None, tracking_tab=None) -> None:
         self.det = detection_tab or self.det
@@ -233,6 +239,22 @@ class Timeline:
             current = (src() if isinstance(src, weakref.ref) else src) is det_out
         return r[0], r[1], current
 
+    # ------------------------------------------------------------------ runs in progress
+    def progress(self, kind: str, start: float, done: float, end: float, working: Optional[float] = None,
+                 text: str = "") -> None:
+        """A run of `kind` ("detection" / "tracking") in progress, called from its thread: [start, done] processed,
+        [done, working] being processed, planned up to `end`. The bars show it until progress_end."""
+        self.live[kind] = (float(start), float(done), float(end), None if working is None else float(working), text)
+
+    def progress_end(self, kind: str) -> None:
+        self.live[kind] = None
+
+    def _update_progress_texts(self) -> None:
+        text = "   ".join(v[4] for v in self.live.values() if v is not None and v[4])
+        for tag in self._progress_texts:
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, text)
+
     # ------------------------------------------------------------------ widgets
     def build(self, name: str, time_info_tag: str = "") -> None:
         """The bar and its controls, in the current container (one per page)."""
@@ -252,6 +274,9 @@ class Timeline:
             dpg.add_text("detected", color=COL_DETECTION[:3])
             dpg.add_text("tracked", color=COL_TRACKING[:3])
             dpg.add_text("processing range", color=COL_RANGE[:3])
+            tag = f"timeline_progress_{name}"
+            dpg.add_text("", tag=tag, color=COL_PROGRESS_TEXT)
+            self._progress_texts.append(tag)
         with dpg.group(horizontal=True):
             dpg.add_button(label="Set start (I)", callback=self.set_start)
             dpg.add_button(label="Set end (O)", callback=self.set_end)
@@ -286,10 +311,15 @@ class Timeline:
         dpg.draw_rectangle((x(t0), y0), (x(t_end), y1), fill=COL_DATA, color=COL_DATA, parent=bar)
         trk = self.tracking_range()
         det = self.detection_range()
-        if det is not None:
+        live_det, live_trk = self.live["detection"], self.live["tracking"]
+        if live_det is not None:  # running: the steps done so far (the results it replaces are not shown)
+            self._draw_live(bar, x, live_det, COL_DETECTION, None)
+        elif det is not None:
             dpg.draw_rectangle((x(det[0]), y0), (max(x(det[1]), x(det[0]) + 1), y1), fill=COL_DETECTION,
                                color=COL_DETECTION, parent=bar)
-        if trk is not None:  # tracks of an earlier detection run: thinner and dark
+        if live_trk is not None:
+            self._draw_live(bar, x, live_trk, COL_TRACKING, COL_TRACKING_WORK)
+        elif trk is not None:  # tracks of an earlier detection run: thinner and dark
             col, (ya, yb) = (COL_TRACKING, (y0, y1)) if trk[2] else (COL_TRACKING_OLD, (y0 + 4, y1 - 4))
             dpg.draw_rectangle((x(trk[0]), ya), (max(x(trk[1]), x(trk[0]) + 1), yb), fill=col, color=col,
                                parent=bar)
@@ -307,14 +337,32 @@ class Timeline:
             dpg.draw_rectangle((a, 0), (b, BAR_HEIGHT - 1), fill=COL_HANDLE, color=(20, 20, 20, 255), rounding=2,
                                parent=bar)
 
+    @staticmethod
+    def _draw_live(bar, x, live, col, col_work) -> None:
+        """A run in progress: the planned interval outlined, filled up to what is done (and, lighter, what is
+        being processed)."""
+        start, done, end, working, _ = live
+        y0, y1 = _BAR_Y
+        planned = col[:3] + (70,)
+        dpg.draw_rectangle((x(start), y0), (x(end), y1), fill=planned, color=planned, parent=bar)
+        if working is not None and working > done:
+            dpg.draw_rectangle((x(done), y0), (x(working), y1), fill=col_work, color=col_work, parent=bar)
+        if done > start:
+            dpg.draw_rectangle((x(start), y0), (max(x(done), x(start) + 1), y1), fill=col, color=col, parent=bar)
+        dpg.draw_line((x(end), y0 - 2), (x(end), y1 + 2), color=col, thickness=2, parent=bar)  # planned end
+
     def _signature(self, g, width):
         det_out = getattr(self.det, "last_result", None)
         trk_out = getattr(self.trk, "last_result", None)
         return (g, width, self.pre.display_t0, self.start, self.end, id(det_out), self.detection_range(),
-                id(trk_out), self.tracking_range())
+                id(trk_out), self.tracking_range(), self.live["detection"], self.live["tracking"])
 
     def refresh(self) -> None:
         """Redraws the shown bars whose content changed (cheap when nothing did: called every frame)."""
+        live = (self.live["detection"], self.live["tracking"])
+        if live != self._progress_sig:
+            self._progress_sig = live
+            self._update_progress_texts()
         g = None
         for bar in self._bars:
             if not dpg.does_item_exist(bar) or not dpg.is_item_visible(bar):

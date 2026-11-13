@@ -920,6 +920,21 @@ class TrackingTab:
         self._status_log_append(f"Tracking {n_clusters} clusters starting in t = [{t_lo:.0f} .. {t_hi:.0f}] us, "
                                 f"in {len(batches)} batch(es) in time order; Stop keeps the batches done")
 
+        timeline = self.preprocessing_tab.timeline
+        bounds = [max(f, t_lo) for f in firsts[1:]] + [t_hi]  # batch b: clusters starting before bounds[b]
+        counts = np.cumsum([len(b) for b in batches])
+
+        def progress(b):
+            """Batch b is being tracked (b = len(batches): all done)."""
+            done = t_lo if b == 0 else bounds[b - 1]
+            working = bounds[b] if b < len(batches) else None
+            pct = 100.0 * (counts[b - 1] if b else 0) / max(n_clusters, 1)
+            text = (f"Tracking {pct:.0f} %: batch {b + 1} of {len(batches)}" if b < len(batches)
+                    else "Tracking: all batches done, finishing")
+            timeline.progress("tracking", t_lo, done, t_hi, working=working, text=text)
+
+        progress(0)
+
         def worker():
             stdout_writer = QueueWriter(self._log_queue)
             stderr_writer = QueueWriter(self._log_queue)
@@ -930,6 +945,7 @@ class TrackingTab:
                         if self._stop_event.is_set():
                             break
                         outs.append(self.engine.run(tracking_chunks.slice_ctx(ctx, idx)))
+                        progress(b + 1)
                         if len(batches) > 1:
                             until = t_hi if b + 1 == len(batches) else firsts[b + 1]
                             self._log_queue.put(f"[TRACKING] batch {b + 1}/{len(batches)} done: clusters starting "
@@ -951,6 +967,7 @@ class TrackingTab:
             except Exception as e:
                 self._log_queue.put(f"[TRACKING] ERROR: {e}")
             finally:
+                timeline.progress_end("tracking")
                 self._log_queue.put("__DONE__")
 
         self._run_thread = threading.Thread(target=worker, daemon=True)
