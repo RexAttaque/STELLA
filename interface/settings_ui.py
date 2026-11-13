@@ -42,7 +42,8 @@ def add_setting_field(key: str, width: int = 150, info_theme=None) -> None:
         if s.is_int:
             dpg.add_input_int(default_value=int(STORE.get(key)), step=1, **common)
         else:
-            dpg.add_input_float(default_value=float(STORE.get(key)), format=s.fmt, step=0, **common)
+            # (double: the value typed reaches the store exactly, a float field would round it to float32)
+            dpg.add_input_double(default_value=float(STORE.get(key)), format=s.fmt, step=0, **common)
         btn = dpg.add_button(label="?", width=22, height=22)
         if info_theme is not None:
             dpg.bind_item_theme(btn, info_theme)
