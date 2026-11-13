@@ -14,6 +14,8 @@ from config.constants import (
     SUPPORTED_FORMATS,
 )
 from utils.paths import default_files_dir
+from utils.masks import MASK_MODES, keep_map, load_masks, save_masks
+from interface.mask_editor import PolygonMaskEditor
 from utils.dataloader import build_preview_and_stats, load_data_file
 from utils.helpers import EventDataHelper
 from utils.plots import (
@@ -60,6 +62,8 @@ class PreprocessingTab:
         self.pseudoframe_texture_tag: str = "preprocessing_pseudoframe_texture"
         self.pseudoframe_dimensions = PSEUDOFAME_DIMENSIONS
         self._geometry_listeners = []  # called with (sensor w, h, display w, h) when the sensor size changes
+        self.masks = []  # polygon masks (utils/masks.py), applied to the events by apply_event_filters
+        self._mask_editor = None
         self.last_loaded_data: Any = None
         self.display_t0: float | None = None
         self.raw_events: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]] = None
@@ -176,47 +180,17 @@ class PreprocessingTab:
                               min_value=1, min_clamped=True, on_enter=True, callback=self.on_sensor_size_typed)
         dpg.add_text("Read from the file when it gives it (Enter to apply a typed value).",
                      tag="preprocessing_sensor_size_status", wrap=430, color=(180, 180, 180))
-        dpg.add_text("ROI:", color=(200, 200, 100))
+        dpg.add_text("Masks:", color=(200, 200, 100))
         with dpg.group(horizontal=True):
-            dpg.add_input_int(
-                label="xmin",
-                tag="roi_xmin",
-                default_value=int(self.params.get("roi_xmin", 0)),
-                width=170,
-                on_enter=True,
-                callback=self.update_roi_param,
-                user_data="roi_xmin",
-            )
-            dpg.add_input_int(
-                label="xmax",
-                tag="roi_xmax",
-                default_value=int(self.params.get("roi_xmax", 1279)),
-                width=170,
-                on_enter=True,
-                callback=self.update_roi_param,
-                user_data="roi_xmax",
-            )
-        
-        with dpg.group(horizontal=True):
-            dpg.add_input_int(
-                label="ymin",
-                tag="roi_ymin",
-                default_value=int(self.params.get("roi_ymin", 0)),
-                width=170,
-                on_enter=True,
-                callback=self.update_roi_param,
-                user_data="roi_ymin",
-            )
-            dpg.add_input_int(
-                label="ymax",
-                tag="roi_ymax",
-                default_value=int(self.params.get("roi_ymax", 719)),
-                width=170,
-                on_enter=True,
-                callback=self.update_roi_param,
-                user_data="roi_ymax",
-            )
-            
+            dpg.add_button(label="Draw new mask", callback=self.on_draw_mask, width=120)
+            dpg.add_button(label="Load...", callback=lambda: dpg.show_item("masks_load_dialog"), width=70)
+            dpg.add_button(label="Save...", callback=self.on_save_masks_clicked, width=70)
+        dpg.add_text("Draw polygons on the pseudo-frame. 'exclude' removes the events inside, 'keep' keeps only the "
+                     "events inside the keep masks. Enabled masks apply to the whole chain (detection, tracking, "
+                     "validation). Click a mask to select it, drag its points, right click a point to delete it.",
+                     wrap=430, color=(160, 160, 160))
+        dpg.add_group(tag="masks_list")
+        dpg.add_text("", tag="masks_status", wrap=430, color=(100, 255, 100))
         dpg.add_separator()
         dpg.add_text("Time range:", color=(200, 200, 100))
         dpg.add_checkbox(
@@ -284,6 +258,13 @@ class PreprocessingTab:
                 dpg.add_file_extension(".mat", color=(150, 255, 150, 255))
             
             
+        for tag, label, cb in (("masks_load_dialog", "Load masks", self.on_load_masks_selected),
+                               ("masks_save_dialog", "Save masks", self.on_save_masks_selected)):
+            if not dpg.does_item_exist(tag):
+                with dpg.file_dialog(tag=tag, label=label, directory_selector=False, default_path=default_files_dir(),
+                                     show=False, callback=cb, width=800, height=500):
+                    dpg.add_file_extension(".json", color=(150, 255, 150, 255))
+
         if not dpg.does_item_exist("data_file_dialog"):
             with dpg.file_dialog(
                 tag="data_file_dialog",
@@ -306,11 +287,17 @@ class PreprocessingTab:
                 dpg.delete_item("preprocessing_parameters_display")
         except Exception:
             pass
-        dpg.add_image(self.pseudoframe_texture_tag, width=self.pseudoframe_dimensions[0], height=self.pseudoframe_dimensions[1], tag="preprocessing_pseudoframe_image")
-        self.view_zoom.register("preprocessing_pseudoframe_image", lambda uv_min, uv_max: dpg.configure_item(
-            "preprocessing_pseudoframe_image", uv_min=uv_min, uv_max=uv_max))
-        self.register_geometry_listener(lambda w, h, dw, dh: dpg.configure_item(
-            "preprocessing_pseudoframe_image", width=dw, height=dh))
+        dw, dh = self.display_size()
+        with dpg.drawlist(width=dw, height=dh, tag="preprocessing_pf_drawlist"):
+            dpg.draw_image(self.pseudoframe_texture_tag, pmin=[0, 0], pmax=[dw, dh], tag="preprocessing_pseudoframe_image")
+            with dpg.draw_node(tag="preprocessing_masks_node"):
+                pass
+        self._mask_editor = PolygonMaskEditor(
+            "preprocessing_pf_drawlist", "preprocessing_masks_node", self.masks,
+            geometry=lambda: (*self.sensor_size(), *self.display_size()), zoom=self.view_zoom,
+            on_change=self._on_masks_changed, on_message=self._mask_message)
+        self.view_zoom.register("preprocessing_pf_drawlist", self._apply_view_zoom)
+        self.register_geometry_listener(self._on_own_geometry)
         dpg.add_text("Load data to generate pseudo-frame.", tag="preprocessing_pseudoframe_status", wrap=730)
         
         with dpg.group(horizontal=True):
@@ -415,18 +402,8 @@ class PreprocessingTab:
             if dpg.does_item_exist("time_tmax"):
                 dpg.set_value("time_tmax", tmax)
     
-            if "roi_xmax" not in self.params:
-                xs, ys, ts, ps = self.raw_events
-                self.params["roi_xmin"] = int(np.min(xs))
-                self.params["roi_xmax"] = int(np.max(xs))
-                self.params["roi_ymin"] = int(np.min(ys))
-                self.params["roi_ymax"] = int(np.max(ys))
-                for k in ("roi_xmin","roi_xmax","roi_ymin","roi_ymax"):
-                    if dpg.does_item_exist(k):
-                        dpg.set_value(k, self.params[k])
-            
             self.apply_event_filters()
-            self.update_pseudoframe_from_data("Data loaded, ROI applied.")
+            self.update_pseudoframe_from_data("Data loaded, masks applied.")
             
             xs, ys, ts, ps = self.filtered_events if self.filtered_events else self.raw_events
             self.display_t0 = float(ts[0]) if len(ts) else None
@@ -440,16 +417,6 @@ class PreprocessingTab:
             return
 
         xs, ys, ts, ps = self.raw_events
-
-        xmin = int(self.params.get("roi_xmin", 0))
-        xmax = int(self.params.get("roi_xmax", 1279))
-        ymin = int(self.params.get("roi_ymin", 0))
-        ymax = int(self.params.get("roi_ymax", 719))
-
-        if xmax < xmin:
-            xmin, xmax = xmax, xmin
-        if ymax < ymin:
-            ymin, ymax = ymax, ymin
 
         # raw events are time sorted (see _time_sorted): the time crop is a slice
         lo, hi = 0, len(ts)
@@ -475,15 +442,15 @@ class PreprocessingTab:
         def _and(m):
             nonlocal mask
             mask = m if mask is None else (mask & m)
-        if X.size:
-            if X.min() < xmin:
-                _and(X >= xmin)
-            if X.max() > xmax:
-                _and(X <= xmax)
-            if Y.min() < ymin:
-                _and(Y >= ymin)
-            if Y.max() > ymax:
-                _and(Y <= ymax)
+        W, H = self.sensor_size()
+        n_outside = 0
+        if X.size and (X.min() < 0 or X.max() >= W or Y.min() < 0 or Y.max() >= H):  # outside the sensor
+            inside = (X >= 0) & (X < W) & (Y >= 0) & (Y < H)
+            n_outside = int(inside.size - np.count_nonzero(inside))
+            _and(inside)
+        keep = keep_map(self.masks, W, H)
+        if keep is not None and X.size:
+            _and(keep[np.clip(Y, 0, H - 1).astype(np.intp), np.clip(X, 0, W - 1).astype(np.intp)])
         polarity = self.params.get("polarity", POLARITY_OPTIONS[0])
         if P is not None and polarity != "ON and OFF":
             _and(P > 0 if polarity == "ON only" else P <= 0)
@@ -498,6 +465,12 @@ class PreprocessingTab:
         Pf = P
         self.filtered_events = (Xf, Yf, Tf, Pf)
         self.log_status(f"Filters applied: kept {Xf.size} / {len(xs)} events")
+        if n_outside:
+            self.log_status(f"{n_outside} events outside the {W} x {H} sensor removed: check the sensor size")
+        if dpg.does_item_exist("masks_status"):
+            n_on = sum(1 for m in self.masks if m.enabled and len(m.points) >= 3)
+            dpg.set_value("masks_status", f"{len(self.masks)} mask(s), {n_on} enabled: {Xf.size} of {len(xs)} "
+                                          f"events kept" if self.masks else "")
 
     # ------------------------------------------------------------------
     # Sensor size and polarity
@@ -554,12 +527,106 @@ class PreprocessingTab:
             self.apply_event_filters()
             self.update_pseudoframe_from_data("Polarity changed.")
 
-    def update_roi_param(self, sender, app_data, user_data):
-        self.params[user_data] = int(app_data)
+    # ------------------------------------------------------------------
+    # Masks
+    # ------------------------------------------------------------------
+    def _apply_view_zoom(self, uv_min, uv_max) -> None:
+        dpg.configure_item("preprocessing_pseudoframe_image", uv_min=uv_min, uv_max=uv_max)
+        if self._mask_editor is not None:
+            self._mask_editor.redraw()
 
-        if self.raw_events:
+    def _on_own_geometry(self, width, height, display_w, display_h) -> None:
+        dpg.configure_item("preprocessing_pf_drawlist", width=display_w, height=display_h)
+        dpg.configure_item("preprocessing_pseudoframe_image", pmax=[display_w, display_h])
+        if self._mask_editor is not None:
+            self._mask_editor.redraw()
+
+    def _mask_message(self, text: str) -> None:
+        if dpg.does_item_exist("masks_status"):
+            dpg.set_value("masks_status", text)
+        self.log_status(text)
+
+    def on_draw_mask(self, sender=None, app_data=None, user_data=None) -> None:
+        if self._mask_editor is not None:
+            self._mask_editor.start_drawing()
+
+    def _on_masks_changed(self, committed: bool) -> None:
+        """committed: the masks changed (filter the events again); otherwise only the selection did."""
+        self._rebuild_masks_list()
+        if committed and getattr(self, "raw_events", None):
             self.apply_event_filters()
-            self.update_pseudoframe_from_data("ROI updated.")
+            self.update_pseudoframe_from_data("Masks applied.")
+        if self._mask_editor is not None:
+            self._mask_editor.redraw()
+
+    def _rebuild_masks_list(self) -> None:
+        if not dpg.does_item_exist("masks_list"):
+            return
+        dpg.delete_item("masks_list", children_only=True)
+        selected = self._mask_editor.selected if self._mask_editor is not None else -1
+        for i, m in enumerate(self.masks):
+            with dpg.group(horizontal=True, parent="masks_list"):
+                dpg.add_checkbox(default_value=m.enabled, user_data=i, callback=self._on_mask_enabled)
+                dpg.add_input_text(default_value=m.name, width=130, user_data=i, callback=self._on_mask_renamed)
+                dpg.add_combo(items=list(MASK_MODES), default_value=m.mode, width=90, user_data=i,
+                              callback=self._on_mask_mode)
+                dpg.add_button(label="selected" if i == selected else "select", width=70, user_data=i,
+                               callback=lambda s, a, u: (self._mask_editor.select(u), self._rebuild_masks_list()))
+                dpg.add_button(label="X", width=25, user_data=i, callback=self._on_mask_deleted)
+
+    def _on_mask_enabled(self, sender, app_data, user_data) -> None:
+        self.masks[user_data].enabled = bool(app_data)
+        self._on_masks_changed(True)
+
+    def _on_mask_renamed(self, sender, app_data, user_data) -> None:
+        self.masks[user_data].name = str(app_data)
+        if self._mask_editor is not None:
+            self._mask_editor.redraw()
+
+    def _on_mask_mode(self, sender, app_data, user_data) -> None:
+        self.masks[user_data].mode = str(app_data)
+        self._on_masks_changed(True)
+
+    def _on_mask_deleted(self, sender, app_data, user_data) -> None:
+        name = self.masks[user_data].name
+        del self.masks[user_data]
+        if self._mask_editor is not None:
+            self._mask_editor.select(-1)
+        self._mask_message(f"{name} deleted.")
+        self._on_masks_changed(True)
+
+    def on_save_masks_clicked(self, sender=None, app_data=None, user_data=None) -> None:
+        if not self.masks:
+            self._mask_message("No masks to save.")
+            return
+        dpg.show_item("masks_save_dialog")
+
+    def on_save_masks_selected(self, sender, app_data, user_data=None) -> None:
+        path = Path(str(app_data.get("file_path_name", "")).strip())
+        if not str(path):
+            return
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(".json")
+        try:
+            save_masks(path, self.masks)
+            self._mask_message(f"Masks saved: {path}")
+        except Exception as e:
+            self._mask_message(f"Saving masks failed: {e}")
+
+    def on_load_masks_selected(self, sender, app_data, user_data=None) -> None:
+        path = str(app_data.get("file_path_name", "")).strip()
+        if not path:
+            return
+        try:
+            loaded = load_masks(path)
+        except Exception as e:
+            self._mask_message(f"Loading masks failed: {e}")
+            return
+        self.masks[:] = loaded  # (the editor holds this list)
+        if self._mask_editor is not None:
+            self._mask_editor.select(-1)
+        self._mask_message(f"{len(loaded)} mask(s) loaded from {path}")
+        self._on_masks_changed(True)
             
     def update_time_param(self, sender, app_data, user_data):
         self.params[user_data] = float(app_data)
@@ -691,7 +758,7 @@ class PreprocessingTab:
 
     def update_pseudoframe_from_data(self, message: Optional[str] = None) -> None:
         if not self.filtered_events:
-            self.update_pseudoframe_visualization(None, "Pseudo-frame preview unavailable (no events / ROI empty).")
+            self.update_pseudoframe_visualization(None, "Pseudo-frame preview unavailable (no events, or all masked).")
             self.log_status("Cannot generate pseudo-frame: no filtered events available")
             return
         try:
