@@ -2,8 +2,10 @@
 
 The bar spans the recording (the events shown by Preprocessing, after the time crop), one accumulation step per
 frame. Colours: blue where there is only input data, green where the current detection results cover the
-recording, red where the current tracking results do (dark red: tracks of an earlier detection run). A yellow
-strip marks the range the steps run on, when only part of the recording is processed.
+recording, red where the current tracking results do (dark red: tracks of an earlier detection run): only the part
+actually processed (a stopped run covers less than asked). Runs start at the start mark, or at the displayed step
+when none is set, and go to the end mark, or to the end of the recording unless stopped. A yellow strip shows the
+marks.
 
 Mouse: click or drag on the bar. Keys (not while typing in a field): Left / Right one step (Shift: 10),
 Home / End, Space play / pause, I / O set the start / end of the range at the displayed step.
@@ -75,6 +77,7 @@ class Timeline:
         self._extents: dict[tuple, Optional[tuple]] = {}
         self._input_items: dict[int, bool] = {}
         self._range_listeners: list[Callable[[], None]] = []
+        self._text_sig = None
 
     def attach(self, detection_tab=None, tracking_tab=None) -> None:
         self.det = detection_tab or self.det
@@ -128,17 +131,19 @@ class Timeline:
             self.seek(k + n)
 
     # ------------------------------------------------------------------ range of the recording to process
-    def range_steps(self, grid=None) -> Optional[tuple[float, float, int]]:
-        """(start, end, number of steps) of the range on the step grid, or None for the whole recording."""
+    def run_steps(self, grid=None) -> Optional[tuple[float, float, int, bool]]:
+        """(start, end, number of steps, whole recording?) of the next run: from the start mark, or the displayed
+        step when no start is set, to the end mark, or the end of the recording when no end is set (the run can be
+        stopped before). None without data, or when the displayed step is after the end mark."""
         g = grid or self.grid()
-        if g is None or (self.start is None and self.end is None):
+        if g is None:
             return None
         t0, step, K = g
-        ks = 0 if self.start is None else min(max(int(round((self.start - t0) / step)), 0), K - 1)
-        ke = K if self.end is None else min(max(int(round((self.end - t0) / step)), ks + 1), K)
-        if ks == 0 and ke == K:
+        ks = self.index(g) if self.start is None else min(max(int(round((self.start - t0) / step)), 0), K - 1)
+        ke = K if self.end is None else min(max(int(round((self.end - t0) / step)), 0), K)
+        if ke <= ks:
             return None
-        return t0 + ks * step, t0 + ke * step, ke - ks
+        return t0 + ks * step, t0 + ke * step, ke - ks, ks == 0 and ke == K
 
     def set_start(self, *_):
         g, k = self.grid(), self.index()
@@ -172,11 +177,7 @@ class Timeline:
 
     def _range_changed(self) -> None:
         self._update_range_texts()
-        r = self.range_steps()
-        if r is None:
-            self.pre.log_status("Processing range: whole recording.")
-        else:
-            self.pre.log_status(f"Processing range: t = [{r[0]:.0f} .. {r[1]:.0f}] us ({r[2]} time steps).")
+        self.pre.log_status(self.range_text())
         for cb in self._range_listeners:
             try:
                 cb()
@@ -184,10 +185,14 @@ class Timeline:
                 print(f"[TIMELINE] range listener failed: {e}")
 
     def range_text(self) -> str:
-        r = self.range_steps()
+        r = self.run_steps()
         if r is None:
-            return "Steps run on the whole recording."
-        return f"Steps run on t = [{r[0]:.0f} .. {r[1]:.0f}] us ({r[2]} time steps)."
+            if self.grid() is None:
+                return "No data loaded."
+            return "Nothing to run: the displayed step is after the end mark (go back, or set a start)."
+        frm = "the start mark" if self.start is not None else "the displayed step"
+        to = "the end mark" if self.end is not None else "the end of the recording (or Stop)"
+        return f"Next run: from {frm} to {to}, t = [{r[0]:.0f} .. {r[1]:.0f}] us, {r[2]} time steps."
 
     def _update_range_texts(self) -> None:
         text = self.range_text()
@@ -250,7 +255,7 @@ class Timeline:
         with dpg.group(horizontal=True):
             dpg.add_button(label="Set start (I)", callback=self.set_start)
             dpg.add_button(label="Set end (O)", callback=self.set_end)
-            dpg.add_button(label="Whole recording", callback=self.clear_range)
+            dpg.add_button(label="Clear marks", callback=self.clear_range)
             tag = f"timeline_range_{name}"
             dpg.add_text(self.range_text(), tag=tag)
             self._range_texts.append(tag)
@@ -288,8 +293,8 @@ class Timeline:
             col, (ya, yb) = (COL_TRACKING, (y0, y1)) if trk[2] else (COL_TRACKING_OLD, (y0 + 4, y1 - 4))
             dpg.draw_rectangle((x(trk[0]), ya), (max(x(trk[1]), x(trk[0]) + 1), yb), fill=col, color=col,
                                parent=bar)
-        r = self.range_steps(g)
-        if r is not None:
+        r = self.run_steps(g)
+        if r is not None and (self.start is not None or self.end is not None):  # the marks set
             xs, xe = x(r[0]), x(r[1])
             dpg.draw_rectangle((xs, 2), (xe, 6), fill=COL_RANGE, color=COL_RANGE, parent=bar)
             for xx in (xs, xe):
@@ -321,6 +326,9 @@ class Timeline:
             if self._drawn.get(bar) != sig:
                 self._drawn[bar] = sig
                 self._draw(bar, g[0], width)
+                if self._text_sig != (g[0],) + sig[2:5]:  # the next run starts at the displayed step
+                    self._text_sig = (g[0],) + sig[2:5]
+                    self._update_range_texts()
 
     # ------------------------------------------------------------------ input
     def _install_handlers(self) -> None:

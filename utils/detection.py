@@ -168,6 +168,8 @@ def _prepare_fast_step(k):
 
 
 tic_start_ges = time.time()
+# part of the recording processed (us): grows with every finished step of the first pass (a stopped run covers less)
+time_range = (float(T_min), float(T_min))
 #%% main loop
 for multi in range(multiN):
     _T_sorted = _is_time_sorted(T_global)
@@ -790,6 +792,8 @@ for multi in range(multiN):
         tic_end = time.time()
         if k % 10 == 0:
             print(f"Loop {k} completed in {tic_end - tic_start} seconds")
+        if multi == 0:
+            time_range = (float(T_min), float(T_min + (k + 1) * dt))
         if stop_event is not None and stop_event.is_set():
             break
 

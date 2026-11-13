@@ -857,11 +857,13 @@ class DetectionTab:
         # buffer, steps_rev, search_factor, max_tracks, max_length, ...
         ctx.update(STORE.values("Detection"))
 
-        # part of the recording (range set on the timeline): the steps start at its start and use no event
-        # before it (not even in the overlap of the first step); at most its number of steps
-        r = pt.timeline.range_steps()
-        if r is not None:
-            ctx["t_start"] = ctx["t_floor"] = r[0]
+        # part of the recording (timeline): from the start mark, or the displayed step, to the end mark or the
+        # end of the recording. The steps start there and use no event before it (not even in the overlap of the
+        # first step); at most its number of steps. From the first step: as before (no start time given).
+        r = pt.timeline.run_steps()
+        if r is not None and not r[3]:
+            if r[0] > float(T_global[0]):
+                ctx["t_start"] = ctx["t_floor"] = r[0]
             ctx["N"] = min(int(ctx["N"]), r[2])
         return ctx
 
@@ -904,13 +906,10 @@ class DetectionTab:
             dpg.configure_item("det_button_test_run", enabled=True)
             return
     
-        time_range = self._run_time_range(ctx)
-
         def worker():
             try:
                 dpg.set_value("det_test_run_stats", "-")
                 out = self.engine.run(ctx)
-                self._set_time_range(out, time_range)
                 self._status_log_append("Test run done.")
                 try:
                     self._preview = (out, *self._full_run_preview(ctx, out))
@@ -994,10 +993,11 @@ class DetectionTab:
             ctx = self._build_engine_context()
             ctx["test_mode"] = False
             self._last_run_ctx = ctx
+            if self.preprocessing_tab.timeline.run_steps() is None:
+                raise ValueError("nothing to run: the displayed step is after the end mark")
             time_range = self._run_time_range(ctx)
-            if ctx.get("t_floor") is not None:
-                self._status_log_append(f"Part of the recording: t = [{time_range[0]:.0f} .. {time_range[1]:.0f}] us, "
-                                        f"{ctx['N']} time steps")
+            self._status_log_append(f"Steps t = [{time_range[0]:.0f} .. {time_range[1]:.0f}] us ({ctx['N']} steps); "
+                                    "Stop keeps the steps done")
             if dpg.does_item_exist("det_run_stats"):
                 dpg.set_value("det_run_stats", "-")
         except Exception as e:
@@ -1014,8 +1014,11 @@ class DetectionTab:
             try:
                 with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
                     out = self.engine.run(ctx)
-                    self._set_time_range(out, time_range)
                     self.last_result = out
+                r = getattr(out, "time_range", None)
+                if r is not None and r[1] < time_range[1] - 1e-6:
+                    self._log_queue.put(f"[DETECTION] Stopped: t = [{r[0]:.0f} .. {r[1]:.0f}] us processed "
+                                        f"({int(round((r[1] - r[0]) / float(ctx['dt'])))} of {ctx['N']} steps).")
 
                 self._log_queue.put("[DETECTION] Done.")
                 pt = self.preprocessing_tab
@@ -1062,14 +1065,6 @@ class DetectionTab:
         self._run_thread = threading.Thread(target=worker, daemon=True)
         self._run_thread.start()
     
-    @staticmethod
-    def _set_time_range(out, time_range) -> None:
-        """Part of the recording the results cover (the timeline shows it; kept in saved results)."""
-        try:
-            out.time_range = tuple(float(t) for t in time_range)
-        except Exception:
-            pass
-
     def _on_N_change(self, sender, app_data, user_data):
         self._n_user_set = True
         self.params["N"] = int(app_data)
@@ -1100,8 +1095,8 @@ class DetectionTab:
         if events is None:
             return 1
 
-        r = pt.timeline.range_steps() if hasattr(pt, "timeline") else None
-        if r is not None:  # part of the recording set on the timeline
+        r = pt.timeline.run_steps() if hasattr(pt, "timeline") else None
+        if r is not None:  # from the start mark or the displayed step to the end mark or the end
             return int(r[2])
 
         _, _, T, _ = events
@@ -1195,7 +1190,7 @@ class DetectionTab:
                     continue
                 # cheap signature: this handler runs on every rendered frame while the tab is shown
                 sig = (name, id(Ttmp), int(len(Ttmp)), float(pt.params.get("accumulation_time_ms", 0)),
-                       pt.timeline.start, pt.timeline.end)
+                       pt.timeline.start, pt.timeline.end, pt.timeline.index() if pt.timeline.start is None else 0)
                 T = Ttmp
                 break
             except Exception:

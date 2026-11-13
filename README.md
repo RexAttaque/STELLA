@@ -57,8 +57,8 @@ To start the GUI, run `python main.py`. Changes in the set parameters are confir
 - set the accumulation time to 2 ms
 - `Polarity` selects the events used (ON only, OFF only or both); the sensor size is read from the file (type it in when the file does not give it, 1280 x 720 otherwise)
 - optionally, `Draw new mask` draws a polygon on the pseudo-frame: `exclude` masks remove the events inside, `keep` masks keep only those; enabled masks apply to detection, tracking and validation (masks can be saved and loaded as .json)
-- the bar under the pseudo-frame (on every page) moves through the recording: click or drag it, Left / Right arrows step one accumulation time (Shift: 10), Home / End, Space plays and pauses (speed in steps/s). Its colours show what is done: blue input data, green detected, red tracked (dark red: tracks of an earlier detection run)
-- to process only part of the recording, go to its first step and press `Set start` (key I), then to its last step and press `Set end` (key O). Detection then runs on that part only (the number of time steps follows), tracking and validation work on those results; `Whole recording` goes back to the full recording
+- the bar under the pseudo-frame (on every page) moves through the recording: click or drag it, Left / Right arrows step one accumulation time (Shift: 10), Home / End, Space plays and pauses (speed in steps/s). Its colours show what was actually processed: blue input data, green detected, red tracked (dark red: tracks of an earlier detection run)
+- runs start at the displayed step and go to the end of the recording, or until `Stop` (only the steps done are kept and shown). `Set start` (key I) and `Set end` (key O) mark a fixed part instead, `Clear marks` removes them. Detection steps through that part (the number of time steps follows); tracking tracks the clusters starting in it, in time order, and stops between batches; validation works on the tracks there are
       
 ![Preprocessing](images/Preprocessing.png)
 

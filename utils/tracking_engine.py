@@ -17,6 +17,7 @@ class TrackingOutputs:
     y_plotv: Any
     t_plot: Any
     track_to_cluster: Any
+    time_range: Any = None  # (start, end): the clusters starting in it are tracked, us
 
 class TrackingEngine:
     def __init__(self, script_path: Union[str, Path]):

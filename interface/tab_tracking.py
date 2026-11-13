@@ -25,7 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.tracking_engine import TrackingEngine, TrackingCancelled
+from utils.tracking_engine import TrackingEngine, TrackingCancelled, TrackingOutputs
+from utils import tracking_chunks
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
 from config.settings import STORE
 from interface.settings_ui import add_setting_field
@@ -905,29 +906,48 @@ class TrackingTab:
         try:
             ctx = self._build_engine_context()
             self._last_run_ctx = ctx
+            batches, firsts, (t_lo, t_hi) = self._plan_run(ctx)
         except Exception as e:
             dpg.set_value(self._run_status_tag, f"Input error: {e}")
             dpg.configure_item(self._run_button_tag, enabled=True)
+            if dpg.does_item_exist("track_test_button"):
+                dpg.configure_item("track_test_button", enabled=True)
             return
         source = self._detection_source()
-        time_range = self.preprocessing_tab.timeline.detection_range() if self.preprocessing_tab else None
+        if dpg.does_item_exist("track_stop_button"):
+            dpg.configure_item("track_stop_button", enabled=True)
+        n_clusters = sum(len(b) for b in batches)
+        self._status_log_append(f"Tracking {n_clusters} clusters starting in t = [{t_lo:.0f} .. {t_hi:.0f}] us, "
+                                f"in {len(batches)} batch(es) in time order; Stop keeps the batches done")
 
         def worker():
             stdout_writer = QueueWriter(self._log_queue)
             stderr_writer = QueueWriter(self._log_queue)
             try:
                 with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
-                    out = self.engine.run(ctx)
-                    if time_range is not None:
-                        try:
-                            out.time_range = tuple(time_range)
-                        except Exception:
-                            pass
+                    outs = []
+                    for b, idx in enumerate(batches):
+                        if self._stop_event.is_set():
+                            break
+                        outs.append(self.engine.run(tracking_chunks.slice_ctx(ctx, idx)))
+                        if len(batches) > 1:
+                            until = t_hi if b + 1 == len(batches) else firsts[b + 1]
+                            self._log_queue.put(f"[TRACKING] batch {b + 1}/{len(batches)} done: clusters starting "
+                                                f"before t = {until:.0f} us tracked")
+                    if not outs:
+                        raise TrackingCancelled()
+                    out = tracking_chunks.merge(outs, batches[:len(outs)], TrackingOutputs)
+                    # clusters starting in [t_lo, until) are tracked
+                    until = t_hi if len(outs) == len(batches) else firsts[len(outs)]
+                    out.time_range = (t_lo, until)
                     self._source_detection = source
                     self.last_result = out
+                if len(outs) < len(batches):
+                    self._log_queue.put(f"[TRACKING] Stopped: clusters starting in t = [{t_lo:.0f} .. {until:.0f}] us "
+                                        f"tracked ({len(outs)} of {len(batches)} batches).")
                 self._log_queue.put("[TRACKING] Done.")
             except TrackingCancelled:
-                self._log_queue.put("[TRACKING] Run cancelled by user.")
+                self._log_queue.put("[TRACKING] Stopped before the first batch: previous results kept.")
             except Exception as e:
                 self._log_queue.put(f"[TRACKING] ERROR: {e}")
             finally:
@@ -938,7 +958,7 @@ class TrackingTab:
 
     def _on_stop_tracking_clicked(self, sender=None, app_data=None, user_data=None) -> None:
         self._stop_event.set()
-        self._status_log_append("Stop requested... (tracking.py must check stop_event to interrupt)")
+        self._status_log_append("Stop requested: tracking stops after the current batch.")
 
     # ------------------------------------------------------------------
     # Engine context (analog zu DetectionTab)
@@ -1152,6 +1172,32 @@ class TrackingTab:
         self._run_thread.start()
         
         
+    def _plan_run(self, ctx):
+        """Batches of clusters to track (start-time order), their first start times, and the interval: clusters
+        starting from the start mark, or the displayed step, to the end mark (or the end of the detection results).
+        From the first step to the end: all clusters (a single run's tracks)."""
+        det_out = self.detection_tab.last_result
+        timeline = self.preprocessing_tab.timeline
+        r = timeline.run_steps()
+        if r is None:
+            raise ValueError("nothing to run: the displayed step is after the end mark")
+        key = id(det_out.t_clust)
+        if getattr(self, "_starts_cache", (None,))[0] != key:
+            self._starts_cache = (key, tracking_chunks.cluster_start_times(det_out.t_clust))
+        starts = self._starts_cache[1]
+        n_data = len(ctx["t_m"]) if (ctx.get("lightweight_mode") or ctx.get("pseudo_images")) else len(ctx["t_clust"])
+        limit = int(ctx["max_tracks"]) if int(ctx["max_tracks"]) < n_data else n_data
+        lo, hi = (-np.inf, np.inf) if r[3] else (r[0], r[1] if timeline.end is not None else np.inf)
+        batches, firsts = tracking_chunks.plan(starts[:n_data], lo, hi, limit)
+        if not batches:
+            raise ValueError(f"no cluster starts in t = [{r[0]:.0f} .. {r[1]:.0f}] us")
+        det_rng = timeline.detection_range(det_out)
+        shown_lo, shown_hi = r[0], r[1]  # the part of the recording the run covers when it is not stopped
+        if det_rng is not None:
+            shown_lo, shown_hi = max(shown_lo, det_rng[0]), min(shown_hi, det_rng[1])
+        firsts = [max(f, shown_lo) for f in firsts]
+        return batches, firsts, (shown_lo, max(shown_hi, shown_lo))
+
     def _detection_source(self):
         """Weak reference to the detection results a run starts from (the timeline tells when they changed)."""
         det_out = getattr(self.detection_tab, "last_result", None)

@@ -18,6 +18,7 @@ class DetectionOutputs:
     y_m: Any
     t_m: Any
     ind_clust: Any
+    time_range: Any = None  # (start, end) of the part of the recording processed, us
 
 
 class DetectionEngine:
@@ -51,5 +52,6 @@ class DetectionEngine:
             y_m=ctx["y_m"],
             t_m=ctx["t_m"],
             ind_clust=ctx["ind_clust"],
+            time_range=ctx.get("time_range"),
         )
     
