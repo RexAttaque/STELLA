@@ -328,7 +328,9 @@ for multi in range(multiN):
         else:
             if pseudo_images:
                 centroids, coords = analyze_pseudo_image(X,Y,height,width,area,filtersize)
-                idx = []
+                # an array also when no cluster was active in the previous step (empty frame): idx[row_ind] below
+                # failed on the list ("list indices must be integers or slices, not list")
+                idx = np.zeros(0)
                 points_a = []
                 for i in range(len(x_m)):
                     if len(x_m[i])<1 or valid[i]==0:
