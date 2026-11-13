@@ -4,7 +4,7 @@
 > on real recordings (`.raw` loading ~15x, pseudo-frame navigation ~80x, detection ~9x) with crash and memory
 > fixes, and no pyEBIV needed for `.raw` files. See [PERFORMANCE.md](PERFORMANCE.md) for what changed, the
 > measurements and how it was verified.
-We introduce STELLA (v1.0.2), a modular framework for **s**tatio**t**emporal **e**vent-based **L**agrangian partic**l**e tr**a**cking in fluid flows. The framework is implemented as a GUI in python and takes the raw event stream obtained from an event-based camera as input. Once the data is loaded, the processing is done in four steps: Preprocessing, Detection, Tracking, Validation. In preprocessing, a ROI can be set in time and space and the filtered events can be saved. Subsequently, different algorithms for direct processing and image-based detection can be used to identify clustered events associated to individual particles. Based on the clustered events, particle tracks (position, velocity) can be derived by using a Kalman filter, spline fitting or hybrid approaches. Finally, a track quality filter and a neighborhood filter can be applied to reject spurious tracks during validation. In every step, the evaluation results can be saved and loaded in a way that also just single modules of STELLA can be used. For further information, please find our paper here: [STELLA](https://link.springer.com/article/10.1007/s00348-026-04253-8).
+We introduce STELLA (v1.0.2), a modular framework for **s**tatio**t**emporal **e**vent-based **L**agrangian partic**l**e tr**a**cking in fluid flows. The framework is implemented as a GUI in python and takes the raw event stream obtained from an event-based camera as input. Once the data is loaded, the processing is done in four steps: Preprocessing, Detection, Tracking, Validation. In preprocessing, the events can be selected by polarity, time range and polygon masks drawn on the view, and the filtered events can be saved. Subsequently, different algorithms for direct processing and image-based detection can be used to identify clustered events associated to individual particles. Based on the clustered events, particle tracks (position, velocity) can be derived by using a Kalman filter, spline fitting or hybrid approaches. Finally, a track quality filter and a neighborhood filter can be applied to reject spurious tracks during validation. In every step, the evaluation results can be saved and loaded in a way that also just single modules of STELLA can be used. For further information, please find our paper here: [STELLA](https://link.springer.com/article/10.1007/s00348-026-04253-8).
 
 ![Pipeline Overview](images/workflow.png)
 
@@ -55,6 +55,8 @@ To start the GUI, run `python main.py`. Changes in the set parameters are confir
 1) **Preprocessing**
 - select `datasets/experimental.npz` as data file (Browse, or paste its path and press Enter): it is loaded right away
 - set the accumulation time to 2 ms
+- `Polarity` selects the events used (ON only, OFF only or both); the sensor size is read from the file (type it in when the file does not give it, 1280 x 720 otherwise)
+- optionally, `Draw new mask` draws a polygon on the pseudo-frame: `exclude` masks remove the events inside, `keep` masks keep only those; enabled masks apply to detection, tracking and validation (masks can be saved and loaded as .json)
       
 ![Preprocessing](images/Preprocessing.png)
 
@@ -90,5 +92,8 @@ To start the GUI, run `python main.py`. Changes in the set parameters are confir
 ![validation](images/validation.png)
 - in the lower left panel, the validated tracks can be saved as .npz or .mat file
 - for further post processing, see `plot_results.py` regarding handling of the output data
+# Settings
+The main parameters are on their pages. Parameters that are rarely tuned (detection engine sizes, kd-tree and pseudo-frame rules, smoothing of the Kalman tracks, B-spline search details, validation normalisation, ...) are under `Settings > Algorithm settings...` in the menu bar. Their defaults give the results of the previous versions; changed values are kept for the next session, and detection results files store the detection values.
+
 # Handling output
 For further usage and plotting, the particle tracks saved in the validation step can be processed in python. An example data handling if provided in the standalone code `plot_results.py`.

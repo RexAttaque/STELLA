@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 import numpy as np
 from utils.raw_loader import load_raw
+from config.settings import STORE
 
 @dataclass
 class LoadedData:
@@ -22,7 +23,8 @@ def _load_events_with_metavision(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[int], Optional[int]]:
     # Numba EVT 3.0 decoder, identical events to pyEBIV.loadRaw() + time()/x()/y()/p()
     # but ~10x faster and without converting 100 M events through Python lists.
-    raw = load_raw(file_path, t_dtype=np.float64)  # times decoded as float64 (exact): no conversion pass
+    # times decoded as float64 (exact): no conversion pass
+    raw = load_raw(file_path, max_events=int(STORE.get("raw_max_events")), t_dtype=np.float64)
     if not raw.geometry_found:  # (decoded with the loader's 1280 x 720 fallback)
         return raw.x, raw.y, raw.t, raw.p, None, None
     return raw.x, raw.y, raw.t, raw.p, raw.width, raw.height

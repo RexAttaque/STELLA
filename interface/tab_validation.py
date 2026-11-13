@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
+from config.settings import STORE
 from utils.paths import default_files_dir
 from utils.track_index import tracks_in_window
 
@@ -589,7 +590,7 @@ class ValidationTab:
                 ref = np.nanpercentile(x, q * 100.0)
                 return x / (ref + 1e-8)
     
-            q = float(self.params.get("track_quality_quantile", 0.95))
+            q = float(STORE.get("track_quality_quantile"))
             angle_mean = quantile_norm(angle_mean, q)
             velo_var = quantile_norm(velo_var, q)
             pathlength_rel = quantile_norm(pathlength_rel, q)
@@ -618,7 +619,7 @@ class ValidationTab:
             dt = float(self.params.get("nb_dt_factor", 2.0)) * acc_us
     
             radius = float(self.params.get("nb_radius", 30.0))
-            sigma_r = radius
+            sigma_r = float(STORE.get("nb_sigma")) or radius  # (Settings: 0 = the radius)
             mad_factor = float(self.params.get("nb_mad_factor", 10.0))
             angle_factor = float(self.params.get("nb_angle_factor", 8.0))
             min_neighbors = int(self.params.get("nb_min_neighbors", 5))

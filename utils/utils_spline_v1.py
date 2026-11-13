@@ -34,11 +34,27 @@ def _spline_fit_worker(t_data, x_data, current_s, queue):
 def _spline_fit_in_thread(t_data_thread, x_data_thread, current_s_thread):
     return UnivariateSpline(t_data_thread, x_data_thread, s=current_s_thread)
     
-def fit_model_bspline_fast(t, x, y, s, dt,RMS_threshold,both,factor):
+# search settings (config/settings.py, Tracking); the defaults are the former fixed values
+SPLINE_DEFAULTS = {
+    "spline_timeout": 5.0,  # s per fit
+    "spline_s_max": 9e7,  # range of the smoothing-factor schedule that is tried
+    "spline_s_min": 0.01,
+    "spline_start_rms": 100.0,
+    "spline_bounds_margin": 100.0,  # px around the track
+    "spline_stop_s": 2e2,
+    "spline_accept_ratio": 1.02,
+    "spline_tolerance_ratio": 1.15,
+    "spline_min_points": 3,
+}
+
+
+def fit_model_bspline_fast(t, x, y, s, dt,RMS_threshold,both,factor,opts=None):
+    o = dict(SPLINE_DEFAULTS, **(opts or {}))
+    min_points = int(o["spline_min_points"])
     t = t[~np.isnan(t)]
     x = x[~np.isnan(x)]
     y = y[~np.isnan(y)]
-    if np.sum(~np.isnan(t)) < 3 or np.sum(~np.isnan(x)) < 3:
+    if np.sum(~np.isnan(t)) < min_points or np.sum(~np.isnan(x)) < min_points:
         return np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
 
     sort_idx = np.argsort(t, axis=None)
@@ -82,6 +98,9 @@ def fit_model_bspline_fast(t, x, y, s, dt,RMS_threshold,both,factor):
         np.arange(1e0, 0, -1e-1),
         np.arange(1e-1, 0, -1e-2)
     ])
+    # the part of the schedule in [s_min, s_max] (relative tolerance: the aranges are not exact decimals)
+    s_in = (s <= float(o["spline_s_max"]) * (1 + 1e-9)) & (s >= float(o["spline_s_min"]) * (1 - 1e-9))
+    s = s[s_in] if s_in.any() else np.array([float(o["spline_s_max"])])
     steps = len(t_fit)
     if steps == 0: 
         final_s_value_for_fit = s[0] 
@@ -106,9 +125,13 @@ def fit_model_bspline_fast(t, x, y, s, dt,RMS_threshold,both,factor):
     x_mean = np.array(x_mean)
     y_mean = np.array(y_mean)
 
-    current_RMS = 100
+    current_RMS = float(o["spline_start_rms"])
     old_RMS = current_RMS
-    TIMEOUT_PER_SPLINE_FIT = 5
+    TIMEOUT_PER_SPLINE_FIT = float(o["spline_timeout"])
+    margin = float(o["spline_bounds_margin"])
+    stop_s = float(o["spline_stop_s"])
+    accept = float(o["spline_accept_ratio"])
+    tolerance = float(o["spline_tolerance_ratio"])
     last_successful_m_index = 0
     m = 0
     mask = np.where(t<t_fit[steps-1])
@@ -116,7 +139,7 @@ def fit_model_bspline_fast(t, x, y, s, dt,RMS_threshold,both,factor):
     x_test = x[mask]
     y_test = y[mask]
 
-    if len(t_test) < 3 or len(t) < 3: 
+    if len(t_test) < min_points or len(t) < min_points: 
         x_fit = np.array([], dtype=np.float64)
         u_fit = np.array([], dtype=np.float64)
         t_fit = np.array([], dtype=np.float64)
@@ -124,10 +147,10 @@ def fit_model_bspline_fast(t, x, y, s, dt,RMS_threshold,both,factor):
         v_fit = np.array([], dtype=np.float64)  
         return x_fit, u_fit, t_fit, y_fit, v_fit
 
-    x_max = int(np.nanmax(x_test))+100
-    x_min = int(np.nanmin(x_test))-100
-    y_max = int(np.nanmax(y_test))+100
-    y_min = int(np.nanmin(y_test))-100
+    x_max = int(np.nanmax(x_test))+margin
+    x_min = int(np.nanmin(x_test))-margin
+    y_max = int(np.nanmax(y_test))+margin
+    y_min = int(np.nanmin(y_test))-margin
     while current_RMS > RMS_threshold and m < len(s):
         current_s_value = s[m]
         
@@ -146,16 +169,16 @@ def fit_model_bspline_fast(t, x, y, s, dt,RMS_threshold,both,factor):
     
                 current_RMS = np.sqrt(np.nanmean((x_mean - x_fit_temp)**2+(y_mean-y_fit_temp)**2))
                 if np.nanmax(x_fit_temp)>x_max or np.nanmin(x_fit_temp)<x_min or np.nanmax(y_fit_temp)>y_max or np.nanmin(y_fit_temp)<y_min:
-                    if current_s_value<2e2:
+                    if current_s_value<stop_s:
                         break
                     else:
                         pass
-                elif current_RMS<1.02*old_RMS:
+                elif current_RMS<accept*old_RMS:
                     last_successful_m_index = m
                     old_RMS=current_RMS
-                elif current_RMS<1.15*old_RMS:
+                elif current_RMS<tolerance*old_RMS:
                     pass
-                elif current_s_value<2e2:
+                elif current_s_value<stop_s:
                     break
             except concurrent.futures.TimeoutError:
                 future.cancel()

@@ -302,12 +302,13 @@ def _touched(a, b, dilate, offs, order, xs, ys, labelmap, out):
 
 
 @njit(cache=True, nogil=True)
-def _split(cl, nt, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y, cx, cy, cnt, clg, asg, two):
+def _split(cl, nt, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y, cx, cy, cnt, clg, asg, two, merge_dist):
     """Split of a region touching the clusters cl[:nt] (ascending) between their centres (mean of their active
     pixels): asg[e] = index in cl of the cluster event order[e] goes to, cnt[c] = its number of events, clg[c] the
     number of them with T >= 0 (its history entries).
 
-    Centres closer than 4 px to another centre are moved out of reach (pdist / squareform, d < 4). `two` is 2.0
+    Centres closer than merge_dist (4 px by default) to another centre are moved out of reach (pdist / squareform,
+    d < merge_dist). `two` is 2.0
     passed at run time: the original squares distances with np.float64 ** 2 (the C pow), which is not always the
     correctly rounded x * x; a run-time exponent keeps that call.
     """
@@ -326,7 +327,7 @@ def _split(cl, nt, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y, cx, cy, 
         for d in range(c + 1, nt):
             dx = cx[c] - cx[d]
             dy = cy[c] - cy[d]
-            if np.sqrt(dx * dx + dy * dy) < 4:
+            if np.sqrt(dx * dx + dy * dy) < merge_dist:
                 cnt[c] = 1
                 cnt[d] = 1
     for c in range(nt):
@@ -353,7 +354,8 @@ def _split(cl, nt, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y, cx, cy, 
 @njit(cache=True, nogil=True, parallel=True)
 def _match(k, dilate, offs, xs, ys, Xw, Yw, Tw, indw, order, off, labelmap, vlist,
            ap_off, ap_len, ap_x, ap_y, steps, inactive_k, x_m, y_m, t_m, mark,
-           nap_x, nap_y, ent_slot, ent_off, ent_len, ent_lg, log_ind, newlabs, reg_lg, two):
+           nap_x, nap_y, ent_slot, ent_off, ent_len, ent_lg, log_ind, newlabs, reg_lg, two,
+           merge_dist, split_min, new_events):
     """Match the regions of one step to the valid clusters (the region loop of the pixelwise branch).
 
     The original takes the regions in ascending label order; a cluster that matches a region leaves the label map,
@@ -418,7 +420,7 @@ def _match(k, dilate, offs, xs, ys, Xw, Yw, Tw, indw, order, off, labelmap, vlis
         tn[lab] = nt
         if nt >= 2:
             _split(tl[t0:t0 + nt], nt, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y,
-                   cx[t0:t0 + nt], cy[t0:t0 + nt], cnt[t0:t0 + nt], clg[t0:t0 + nt], asg, two)
+                   cx[t0:t0 + nt], cy[t0:t0 + nt], cnt[t0:t0 + nt], clg[t0:t0 + nt], asg, two, merge_dist)
 
     # 4. resolution, ascending labels
     assigned = np.zeros(n_lab + 1, np.uint8)
@@ -455,11 +457,11 @@ def _match(k, dilate, offs, xs, ys, Xw, Yw, Tw, indw, order, off, labelmap, vlis
             continue
         if ne < nt:
             _split(tl[t0:t0 + ne], ne, a, b, order, xs, ys, Tw, ap_off, ap_len, ap_x, ap_y,
-                   cx[t0:t0 + ne], cy[t0:t0 + ne], cnt[t0:t0 + ne], clg[t0:t0 + ne], asg, two)
-        # clusters with at least 4 events take them; label 0 means "unassigned", so slot 0 never takes part
+                   cx[t0:t0 + ne], cy[t0:t0 + ne], cnt[t0:t0 + ne], clg[t0:t0 + ne], asg, two, merge_dist)
+        # clusters with at least split_min events take them; label 0 means "unassigned", so slot 0 never takes part
         for c in range(ne):
             s = tl[t0 + c]
-            if s == 0 or cnt[t0 + c] < 4:
+            if s == 0 or cnt[t0 + c] < split_min:
                 continue
             mark[s] = 1
             j_lab[nj] = lab
@@ -515,10 +517,10 @@ def _match(k, dilate, offs, xs, ys, Xw, Yw, Tw, indw, order, off, labelmap, vlis
         for p in range(ap_off[s], ap_off[s] + ap_len[s]):
             labelmap[ap_x[p], ap_y[p]] = -1
 
-    # unmatched regions with more than 5 events of this step (T > 0) start new clusters, ascending labels
+    # unmatched regions with at least new_events events of this step (T > 0) start new clusters, ascending labels
     nn = 0
     for lab in range(1, n_lab + 1):
-        if assigned[lab] == 0 and reg_new[lab] > 5:
+        if assigned[lab] == 0 and reg_new[lab] >= new_events:
             newlabs[nn] = lab
             nn += 1
     return j_ap[nj], nj, j_lg[nj], nn
@@ -582,8 +584,8 @@ def _create(k, newlabs, nn, order, off, xs, ys, Xw, Yw, Tw, indw, heap, heap_n,
 
 
 @njit(cache=True, nogil=True)
-def _release(k, thresh, cand, cand_n, steps, inactive, inactive_k, heap, heap_n):
-    """inactive[(steps < buffer) & (steps < min_steps) & (inactive_k + 2 < k)] = 1, over the only slots it can
+def _release(k, thresh, idle, cand, cand_n, steps, inactive, inactive_k, heap, heap_n):
+    """inactive[(steps < buffer) & (steps < min_steps) & (inactive_k + idle < k)] = 1, over the only slots it can
     change (thresh = min(buffer, min_steps)).
 
     `cand` holds every slot with inactive == 0 and steps < thresh: slots enter it when they start a
@@ -594,7 +596,7 @@ def _release(k, thresh, cand, cand_n, steps, inactive, inactive_k, heap, heap_n)
         s = cand[j]
         if steps[s] >= thresh:
             continue
-        if inactive_k[s] + 2 < k:
+        if inactive_k[s] + idle < k:
             inactive[s] = 1
             heap_n = _heap_push(heap, heap_n, s)
             continue
@@ -673,7 +675,8 @@ class PixelwiseTracker:
     """
 
     def __init__(self, height, width, structure, second_pass, buffer, n_global,
-                 steps, inactive, inactive_k, valid, x_m, y_m, t_m, active_pixels, ind_clust, min_steps=3):
+                 steps, inactive, inactive_k, valid, x_m, y_m, t_m, active_pixels, ind_clust, min_steps=3,
+                 new_events=6, idle=2, merge_dist=4.0, split_min=4):
         n = len(steps)
         self.n = n
         self.cap = n
@@ -713,6 +716,10 @@ class PixelwiseTracker:
 
         self.vlist = np.flatnonzero(np.asarray(valid) != 0).astype(np.int64)
         self.thresh = float(min(min_steps, buffer))
+        self.idle = int(idle)  # cluster rules (config/settings.py)
+        self.new_events = int(new_events)
+        self.merge_dist = float(merge_dist)
+        self.split_min = int(split_min)
         self.cand = np.zeros(n, np.int64)
         c = np.flatnonzero((self.inactive == 0) & (self.steps < self.thresh))
         self.cand[:c.size] = c
@@ -787,7 +794,8 @@ class PixelwiseTracker:
             k, self.dilate, self.offs, xs, ys, X, Y, T, ind_global, order, off, self.labelmap, self.vlist,
             self.ap_off, self.ap_len, self.ap_x, self.ap_y, self.steps, self.inactive_k,
             self.x_m, self.y_m, self.t_m, self.mark,
-            nap_x, nap_y, ent_slot, ent_off, ent_len, ent_lg, log_ind, newlabs, reg_lg, 2.0)
+            nap_x, nap_y, ent_slot, ent_off, ent_len, ent_lg, log_ind, newlabs, reg_lg, 2.0,
+            self.merge_dist, self.split_min, self.new_events)
         if nn > 0:
             missing = int(newlabs[nn - 1]) - self.heap_n  # needed = max(idx), the largest new label
             if missing > 0:
@@ -797,7 +805,7 @@ class PixelwiseTracker:
                 self.steps, self.inactive, self.inactive_k, self.x_m, self.y_m, self.t_m, self.tid,
                 self.next_tid, nap_x, nap_y, nap, ent_slot, ent_off, ent_len, nent, ent_lg, log_ind, nlog,
                 self.cand, self.cand_n, reg_lg)
-        self.cand_n, self.heap_n = _release(k, self.thresh, self.cand, self.cand_n, self.steps, self.inactive,
+        self.cand_n, self.heap_n = _release(k, self.thresh, self.idle, self.cand, self.cand_n, self.steps, self.inactive,
                                             self.inactive_k, self.heap, self.heap_n)
         # matched and new clusters are the valid ones of the next step, with their new active pixels
         slots = ent_slot[:nent]

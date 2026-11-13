@@ -27,6 +27,8 @@ if str(ROOT) not in sys.path:
 
 from utils.tracking_engine import TrackingEngine, TrackingCancelled
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
+from config.settings import STORE
+from interface.settings_ui import add_setting_field
 
 if TYPE_CHECKING:
     from interface.tab_preprocessing import PreprocessingTab
@@ -299,6 +301,8 @@ class TrackingTab:
                         "which quantifies the uncertainty\n"
                         "in the measured values."
                     )
+            for key in ("kalman_init_steps", "kalman_p_scale"):
+                add_setting_field(key, width=200, info_theme=info_button_theme)
             
         with dpg.group(show=False, tag="track_group_bspline_params"):
             with dpg.group(horizontal=True):
@@ -318,6 +322,8 @@ class TrackingTab:
                         "is reduced, until the target RMS\n"
                         "to the data points is reached."
                     )
+            for key in ("spline_timeout", "spline_s_max", "spline_s_min"):
+                add_setting_field(key, width=200, info_theme=info_button_theme)
         with dpg.group(horizontal=True):
             dpg.add_input_int(
                 label="resolution factor",
@@ -1018,6 +1024,7 @@ class TrackingTab:
 
             "stop_event": self._stop_event,
         }
+        ctx.update(STORE.values("Tracking"))  # Kalman start, B-spline search, smoothing (config/settings.py)
 
         if method == "B-spline" or method.startswith("hybrid"):
             ctx["target_RMS"] = float(dpg.get_value(self.target_rms))

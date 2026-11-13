@@ -9,7 +9,7 @@ one track at a time under the GIL, so the threads mostly waited for each other. 
 - the Kalman filter runs over chunks of tracks in the worker threads (one task per chunk, not per track);
 - the post-processing of the results (NaN removal, smoothing, truncation) is one parallel compiled pass over
   all tracks instead of ~10 numpy / scipy calls per track. The smoothing reproduces
-  scipy.ndimage.uniform_filter1d(size=3, mode='nearest') operation for operation (running sum, divided at
+  scipy.ndimage.uniform_filter1d(size=window, mode='nearest') operation for operation (running sum, divided at
   output), so the results are bit-identical.
 """
 from concurrent.futures import ThreadPoolExecutor
@@ -159,23 +159,28 @@ def _pack(arrays):
 
 
 @njit(cache=True, nogil=True)
-def _smooth3(a, out):
-    """scipy.ndimage.uniform_filter1d(a, size=3, mode='nearest'): running sum over the edge-extended line,
-    divided at output (the same operations as scipy, so the same bits)."""
+def _smooth(a, out, w):
+    """scipy.ndimage.uniform_filter1d(a, size=w, mode='nearest'): running sum over the edge-extended line (w // 2
+    values before, w - w // 2 - 1 after), divided at output (the same operations as scipy, so the same bits)."""
     n = a.size
     if n == 0:
         return
-    ext = np.empty(n + 2)
-    ext[0] = a[0]
-    ext[1:n + 1] = a
-    ext[n + 1] = a[n - 1]
+    s1 = w // 2
+    s2 = w - s1 - 1
+    ext = np.empty(n + s1 + s2)
+    for q in range(s1):
+        ext[q] = a[0]
+    ext[s1:s1 + n] = a
+    for q in range(s2):
+        ext[s1 + n + q] = a[n - 1]
+    fw = float(w)
     tmp = 0.0
-    for q in range(3):
+    for q in range(w):
         tmp += ext[q]
-    out[0] = tmp / 3.0
+    out[0] = tmp / fw
     for q in range(1, n):
-        tmp += ext[q + 2] - ext[q - 1]
-        out[q] = tmp / 3.0
+        tmp += ext[q + w - 1] - ext[q - 1]
+        out[q] = tmp / fw
 
 
 @njit(cache=True, nogil=True)
@@ -191,7 +196,7 @@ def _finite(src, a, b, scale, out):
 
 
 @njit(cache=True, nogil=True, parallel=True)
-def _post(t, x, xv, xa, y, yv, ya, off_t, off_x, off_xv, off_xa, off_y, off_yv, off_ya, v_scale):
+def _post(t, x, xv, xa, y, yv, ya, off_t, off_x, off_xv, off_xa, off_y, off_yv, off_ya, v_scale, window, passes):
     """Post-processing of the Kalman results of every track (see postprocess_afterwards). Returns the kept tracks
     and, for each of the 7 quantities, its output values and offsets (over the kept tracks)."""
     n = off_x.size - 1
@@ -239,10 +244,13 @@ def _post(t, x, xv, xa, y, yv, ya, off_t, off_x, off_xv, off_xa, off_y, off_yv, 
             buf = np.empty(b - a)
             cnt = _finite(srcs[q], a, b, v_scale if (q == 2 or q == 5) else 1.0, buf)
             buf = buf[:cnt]
-            if q == 1 or q == 2 or q == 4 or q == 5:  # x, y and their velocities: smoothed twice
-                tmp = np.empty(cnt)
-                _smooth3(buf, tmp)
-                _smooth3(tmp, buf)
+            if (q == 1 or q == 2 or q == 4 or q == 5) and passes > 0:  # x, y and their velocities: smoothed
+                src = buf
+                dst = np.empty(cnt)
+                for _ in range(passes):
+                    _smooth(src, dst, window)
+                    src, dst = dst, src
+                buf = src
             out = outs[q]
             p = oo[q, j]
             for k in range(L[q, i]):
@@ -250,11 +258,11 @@ def _post(t, x, xv, xa, y, yv, ya, off_t, off_x, off_xv, off_xa, off_y, off_yv, 
     return kept, outs, oo
 
 
-def postprocess_afterwards(t_plot, x_plot, x_plotv, x_plota, y_plot, y_plotv, y_plota, v_scale):
+def postprocess_afterwards(t_plot, x_plot, x_plotv, x_plota, y_plot, y_plotv, y_plota, v_scale, window=3, passes=2):
     """The post-processing of the Kalman results in utils/tracking.py, for all tracks in one parallel pass:
 
         keep the tracks whose x is not all NaN; velocities times v_scale; NaN removed from every quantity; x, xv,
-        y, yv smoothed twice (uniform_filter1d, size 3, 'nearest'); xv, xa, yv, ya cut to the length of x when x
+        y, yv smoothed `passes` times (uniform_filter1d, size `window`, 'nearest'); xv, xa, yv, ya cut to the length of x when x
         is shorter than xv. (The script also empties t where x is empty: never the case for a kept track.)
 
     Returns (kept track indices, t, x, xv, xa, y, yv, ya as lists of arrays), or None if some array is not
@@ -266,7 +274,8 @@ def postprocess_afterwards(t_plot, x_plot, x_plotv, x_plota, y_plot, y_plotv, y_
             if not (isinstance(a, np.ndarray) and a.dtype == np.float64 and a.ndim == 1):
                 return None
     packed = [_pack(g) for g in groups]
-    kept, outs, oo = _post(*[p[0] for p in packed], *[p[1] for p in packed], float(v_scale))
+    kept, outs, oo = _post(*[p[0] for p in packed], *[p[1] for p in packed], float(v_scale),
+                           max(1, int(window)), max(0, int(passes)))
     lists = []
     for q in range(7):
         data = outs[q]

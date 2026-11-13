@@ -220,7 +220,7 @@ def db_matching(valid,x_m,y_m,t_m,x_temp,y_temp,max_tracks,threshold,idx,del_,st
         return nearest_indices, x_clust, y_clust, x_m, y_m, t_m, steps, inactive_k, valid, t_clust, num_involved,ind_clust
     
     
-def kdtree_clustering(X,Y,T,valid,x_m,y_m,t_m,Range,Lmin,steps,del_,buffer,steps_rev,inactive_k,k,x_clust,y_clust,t_clust,lightweight_mode,num_points,num_involved,ind_clust,ind_global):
+def kdtree_clustering(X,Y,T,valid,x_m,y_m,t_m,Range,Lmin,steps,del_,buffer,steps_rev,inactive_k,k,x_clust,y_clust,t_clust,lightweight_mode,num_points,num_involved,ind_clust,ind_global,radius_margin=4.0):
         points = np.column_stack((X, Y))
         valid_indices = np.where(valid == 1)[0]
         
@@ -236,7 +236,7 @@ def kdtree_clustering(X,Y,T,valid,x_m,y_m,t_m,Range,Lmin,steps,del_,buffer,steps
                 if len(x_clust[i])==0:
                     continue
                 center = [x_m[i], y_m[i]]
-            idx = tree.query_ball_point(center, r=Range+4)
+            idx = tree.query_ball_point(center, r=Range+radius_margin)
 
             if len(idx) > Lmin:
                 if lightweight_mode:
@@ -262,12 +262,12 @@ def kdtree_clustering(X,Y,T,valid,x_m,y_m,t_m,Range,Lmin,steps,del_,buffer,steps
         return x_m, y_m, t_m, x_clust, y_clust, t_clust, steps, inactive_k, valid, X, Y, T, num_involved, ind_clust, ind_global
     
     
-def subgrid_search(height,width,search_factor,minPts,inactive,X,Y):
+def subgrid_search(height,width,search_factor,minPts,inactive,X,Y,factor=5.0):
     g = 0
     startx = height / 2 + (np.random.rand() - 0.5) * height / 1
     starty = width / 2 + (np.random.rand() - 0.5) * width / 1
     factor_array = 4 * (search_factor - np.arange(1, search_factor+1))+1
-    threshold_sub = np.sum(inactive) * minPts * 5 
+    threshold_sub = np.sum(inactive) * minPts * factor
 
     while g < search_factor:
         range_x = height / factor_array[g]
@@ -508,14 +508,14 @@ def _pick_links(targets, off, cand, d2, t_s, t_e, dt, n):
     return lt[:nl], ls[:nl]
 
 
-def _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt):
+def _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt, max_dist=5.0, max_gap=1.0):
     """(targets, sources) of repair_tracks, in the order the links are applied.
 
-    Every start (ascending track index) links to the nearest end within max_dist that is not used yet. The original
-    took the first acceptable end of a cKDTree ball query, whose order is the tree's internal point order.
+    Every start (ascending track index) links to the nearest end within max_dist (px) and max_gap time steps that
+    is not used yet. The original took the first acceptable end of a cKDTree ball query, whose order is the tree's
+    internal point order.
     """
-    max_dtt  = dt
-    max_dist = 5
+    max_dtt = max_gap * dt
 
     ends = np.flatnonzero(~np.isnan(x_e) & ~np.isnan(y_e))
     targets = np.flatnonzero(~np.isnan(x_s) & ~np.isnan(y_s))
@@ -558,7 +558,7 @@ def _apply_links(links_t, links_s, lens, steps):
     return head, nxt, clen
 
 
-def repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt):
+def repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt, max_dist=5.0, max_gap=1.0):
     """repair_tracks for PackedTracks (utils/packed_tracks.py): same links and same track contents.
 
     The four collections are updated in place, like the lists, and returned. The track ends are computed directly
@@ -587,7 +587,7 @@ def repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt):
         _track_ends(x_clust.data, y_clust.data, t_clust.data, x_clust.start[ids], x_clust.stop[ids], ids,
                     float(dt), t_s, t_e, x_s, y_s, x_e, y_e)
 
-    links_t, links_s = _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt)
+    links_t, links_s = _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt, max_dist, max_gap)
     if links_t.size == 0:
         return x_clust, y_clust, t_clust, steps, ind_clust
     if max(int(links_t.max()), int(links_s.max())) >= len(steps):
@@ -604,7 +604,7 @@ def repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt):
     return x_clust, y_clust, t_clust, steps, ind_clust
 
 
-def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
+def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt, max_dist=5.0, max_gap=1.0):
     """Joins a track that starts where (and right after) another one ends.
 
     Same start / end medians as the original per-cluster numpy version (compiled, clusters taken in chunks). Every
@@ -612,7 +612,7 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
     arbitrary choice when several ends qualify.
     """
     if isinstance(x_clust, PackedTracks):
-        return repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt)
+        return repair_tracks_packed(x_clust, y_clust, t_clust, ind_clust, steps, dt, max_dist, max_gap)
     n = len(x_clust)
 
     x_s = np.full(n, np.nan)
@@ -636,7 +636,7 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
         _track_ends(xs, ys, ts, off[:-1], off[1:], sel, float(dt), t_s, t_e, x_s, y_s, x_e, y_e)
         a = b
 
-    links_t, links_s = _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt)
+    links_t, links_s = _find_links(n, x_s, y_s, t_s, x_e, y_e, t_e, dt, max_dist, max_gap)
 
     for idx_target, idx_source in zip(links_t.tolist(), links_s.tolist()):
         if len(x_clust[idx_source]) == 0:
@@ -658,7 +658,7 @@ def repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt):
 def repair_tracks_pseudoframes(
     x_clust, y_clust, t_clust, ind_clust,
     steps, dt,
-    x_m, y_m, t_m
+    x_m, y_m, t_m, max_dist=4.0, max_gap=1.5
 ):
     t_start = np.array([arr[0] * 1e6 for arr in t_m if len(arr) > 0])
     t_end   = np.array([arr[-1] * 1e6 for arr in t_m if len(arr) > 0])
@@ -669,8 +669,8 @@ def repair_tracks_pseudoframes(
     y_start = np.array([arr[0] for arr in y_m if len(arr) > 0])
     y_end   = np.array([arr[-1] for arr in y_m if len(arr) > 0])
 
-    max_dtt  = 1.5 * dt
-    max_dist = 4.0
+    max_dtt = max_gap * dt
+    max_dist = float(max_dist)
     max_dist2 = max_dist * max_dist
 
     order = np.argsort(t_end)

@@ -27,6 +27,8 @@ if str(ROOT) not in sys.path:
 from utils.detection_engine import DetectionEngine
 
 from config.constants import DEFAULT_PARAMS, PSEUDOFAME_DIMENSIONS
+from config.settings import STORE
+from interface.settings_ui import add_setting_field
 
 if TYPE_CHECKING:
     from interface.tab_preprocessing import PreprocessingTab
@@ -326,6 +328,9 @@ class DetectionTab:
                         "Larger values connect pixels over larger gaps;\n"
                         "odd values are recommended for a centered mask."
                     )
+            dpg.add_text("Cluster rules", color=(170, 170, 170))
+            for key in ("new_cluster_events", "split_merge_distance", "split_min_events"):
+                add_setting_field(key, width=150, info_theme=info_button_theme)
         
         with dpg.group(tag=self._group_kdtree, show=False):
         
@@ -491,6 +496,10 @@ class DetectionTab:
                     "A full run keeps a cluster only if it holds at least\n"
                     "this many events in total (over all its time steps)."
                 )
+        add_setting_field("retire_idle_steps", width=150, info_theme=info_button_theme)
+        dpg.add_text("Track repair", color=(170, 170, 170))
+        for key in ("repair_max_distance", "repair_max_gap"):
+            add_setting_field(key, width=150, info_theme=info_button_theme)
 
         with dpg.group(horizontal=True):
             dpg.add_checkbox(
@@ -832,8 +841,6 @@ class DetectionTab:
     
             "height": self.params["width"],
             "width": self.params["height"],
-            "max_tracks": self.params["max_tracks"],
-            "max_length": self.params["max_length"],
     
             "lightweight_mode": lightweight_mode,
             "save_mode": True,
@@ -853,14 +860,14 @@ class DetectionTab:
     
             "N_pixelwise": int(self.params.get("N_pixelwise", 5)),
     
-            "buffer": self.params["buffer"],
-            "steps_rev": self.params["steps_rev"],
             "num_points": 1,
-            "search_factor": self.params["search_factor"],
     
             "multirun": bool(self.params.get("multirun", False)),
             "multitimefactor": int(self.params.get("multitimefactor", 1)),
         }
+        # settings of the page and of the Settings window (config/settings.py): cluster rules, track repair,
+        # buffer, steps_rev, search_factor, max_tracks, max_length, ...
+        ctx.update(STORE.values("Detection"))
     
         return ctx
 
@@ -2062,6 +2069,7 @@ class DetectionTab:
             "structure_size",
             "min_steps",
             "min_events",
+            *STORE.values("Detection"),  # settings of the page / Settings window (config/settings.py)
             "threshold",
             "min_cluster_size",
             "max_cluster_size",
@@ -2145,6 +2153,10 @@ class DetectionTab:
             except Exception:
                 pass
             
+        restored = STORE.update({k: v for k, v in ctx_params.items() if k in STORE.values("Detection")})
+        if restored:
+            self._status_log_append(f"Detection settings restored from the results file: "
+                                    + ", ".join(f"{k}={STORE.get(k)}" for k in restored))
         for key, tag in (("min_steps", "det_input_min_steps"), ("min_events", "det_input_min_events")):
             if key in ctx_params:
                 try:

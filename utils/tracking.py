@@ -15,6 +15,16 @@ except ImportError:
 import multiprocessing
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# settings of the Tracking page / Settings window (config/settings.py); the defaults are the former fixed values
+kalman_init_steps = int(globals().get("kalman_init_steps", 10))
+kalman_p_scale = float(globals().get("kalman_p_scale", 10.0))
+pseudo_kalman_init_steps = int(globals().get("pseudo_kalman_init_steps", 4))
+pseudo_kalman_p_scale = float(globals().get("pseudo_kalman_p_scale", 50.0))
+smooth_window = max(1, int(globals().get("smooth_window", 3)))
+smooth_passes = max(0, int(globals().get("smooth_passes", 2)))
+min_track_points = int(globals().get("min_track_points", 3))
+spline_opts = {k: globals()[k] for k in SPLINE_DEFAULTS if k in globals()}
+
 # %% init
 if lightweight_mode:
     dummy_Kalman_lightweight()
@@ -48,10 +58,12 @@ def _kalman_all(ex_len):
     if lightweight_mode or pseudo_images:
         res = kalman_afterwards(t_m, x_m, y_m, P, C, Q, R, dt, resol,
                                 Kalman_v2_both_buffer_optimized_lightweight_afterwards, num_worker,
-                                st_max=4, inclusive=True, p_scale=50, start_id=0, progress=progress)
+                                st_max=pseudo_kalman_init_steps, inclusive=True, p_scale=pseudo_kalman_p_scale,
+                                start_id=0, progress=progress)
     else:
         res = kalman_afterwards(t_clust, x_clust, y_clust, P, C, Q, R, dt, resol,
-                                Kalman_v2_both_buffer_optimized_afterwards, num_worker, progress=progress)
+                                Kalman_v2_both_buffer_optimized_afterwards, num_worker,
+                                st_max=kalman_init_steps, p_scale=kalman_p_scale, progress=progress)
     bar.close()
     return res
 
@@ -113,7 +125,8 @@ if Kalman_afterwards or use_both or both2:
                 t_plot = [res[2] for res in results]
     
     _pp = postprocess_afterwards(t_plot, x_plot, x_plotv, x_plota, y_plot, y_plotv, y_plota,
-                                 1.0 if (use_both or both2) else 1e-6)
+                                 1.0 if (use_both or both2) else 1e-6,
+                                 window=smooth_window, passes=smooth_passes)
     if _pp is not None:  # all tracks in one parallel pass (utils/tracking_batch.py): same results as below
         valid_idx, t_plot, x_plot, x_plotv, x_plota, y_plot, y_plotv, y_plota = _pp
         track_to_cluster = track_to_cluster[valid_idx]
@@ -149,11 +162,11 @@ if Kalman_afterwards or use_both or both2:
         y_plota = [arr[~np.isnan(arr)] for arr in y_plota]
         t_plot = [t if len(x) > 0 else np.array([]) for x, t in zip(x_plot, t_plot)]
     
-        for ij in range(2):
-            x_plot = [uniform_filter1d(a, size=3, mode='nearest') for a in x_plot]
-            x_plotv = [uniform_filter1d(a, size=3, mode='nearest') for a in x_plotv]
-            y_plot = [uniform_filter1d(a, size=3,  mode='nearest') for a in y_plot]
-            y_plotv = [uniform_filter1d(a, size=3,  mode='nearest') for a in y_plotv]
+        for ij in range(smooth_passes):
+            x_plot = [uniform_filter1d(a, size=smooth_window, mode='nearest') for a in x_plot]
+            x_plotv = [uniform_filter1d(a, size=smooth_window, mode='nearest') for a in x_plotv]
+            y_plot = [uniform_filter1d(a, size=smooth_window, mode='nearest') for a in y_plot]
+            y_plotv = [uniform_filter1d(a, size=smooth_window, mode='nearest') for a in y_plotv]
         
         for j, arr in enumerate(x_plot):
             if len(arr) < len(x_plotv[j]):
@@ -164,7 +177,7 @@ if Kalman_afterwards or use_both or both2:
                     
     
 if both2:
-    valid_idx = [i for i, arr in enumerate(t_plot) if len(arr) > 2]
+    valid_idx = [i for i, arr in enumerate(t_plot) if len(arr) >= min_track_points]
     track_to_cluster = track_to_cluster[valid_idx]
     t_plot = [t_plot[i] for i in valid_idx]
     x_plot = [x_plot[i] for i in valid_idx]
@@ -181,7 +194,7 @@ if both2:
     with parallel_backend('loky', n_jobs=num_worker):
         with tqdm_joblib(tqdm(total=NUM_CLUSTERS_TO_TEST, desc="Spline fitting")):
             results = Parallel()( 
-                delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol) 
+                delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol,spline_opts) 
                 for t, x, y,tt in zip(t_plot, x_plot, y_plot,t_plot)
             )
 
@@ -231,14 +244,14 @@ if spline_fitting or use_both:
             with parallel_backend('loky', n_jobs=num_worker):
                 with tqdm_joblib(tqdm(total=NUM_CLUSTERS_TO_TEST, desc="Spline fitting")):
                     results = Parallel()( 
-                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,[],resol) 
+                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,[],resol,spline_opts) 
                         for t, x, y in zip(t_m, x_m, y_m)
                     )
         else:
             with parallel_backend('loky', n_jobs=num_worker):
                 with tqdm_joblib(tqdm(total=NUM_CLUSTERS_TO_TEST, desc="Spline fitting")):
                     results = Parallel()( 
-                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol) 
+                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol,spline_opts) 
                         for t, x, y,tt in zip(t_m, x_m, y_m,t_plot)
                     )
     else:
@@ -246,14 +259,14 @@ if spline_fitting or use_both:
             with parallel_backend('loky', n_jobs=num_worker):
                 with tqdm_joblib(tqdm(total=NUM_CLUSTERS_TO_TEST, desc="Spline fitting")):
                     results = Parallel()( 
-                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,[],resol) 
+                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,[],resol,spline_opts) 
                         for i, (t, x, y) in enumerate(zip(t_clust, x_clust, y_clust))
                     )
         else:
             with parallel_backend('loky', n_jobs=num_worker):
                 with tqdm_joblib(tqdm(total=NUM_CLUSTERS_TO_TEST, desc="Spline fitting")):
                     results = Parallel()( 
-                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol)
+                        delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol,spline_opts)
                         for t, x, y,tt in zip(t_clust, x_clust, y_clust,t_plot)
                     )
 
@@ -366,11 +379,11 @@ if use_hybrid:
     x_plot = [arr[~np.isnan(arr)] for arr in x_plot]
     y_plot = [arr[~np.isnan(arr)] for arr in y_plot]
     
-    for ij in range(2):
-        x_plot = [uniform_filter1d(a, size=3, mode='nearest') for a in x_plot]
-        y_plot = [uniform_filter1d(a, size=3,  mode='nearest') for a in y_plot]
+    for ij in range(smooth_passes):
+        x_plot = [uniform_filter1d(a, size=smooth_window, mode='nearest') for a in x_plot]
+        y_plot = [uniform_filter1d(a, size=smooth_window, mode='nearest') for a in y_plot]
     
-    valid_idx = [i for i, arr in enumerate(t_plot) if len(arr) > 2]
+    valid_idx = [i for i, arr in enumerate(t_plot) if len(arr) >= min_track_points]
     track_to_cluster = track_to_cluster[valid_idx]
     t_plot = [t_plot[i] for i in valid_idx]
     x_plot = [x_plot[i] for i in valid_idx]
@@ -387,7 +400,7 @@ if use_hybrid:
     with parallel_backend('loky', n_jobs=multiprocessing.cpu_count()):
         with tqdm_joblib(tqdm(total=NUM_CLUSTERS_TO_TEST, desc="Spline fitting")):
             results = Parallel()( 
-                delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol) 
+                delayed(fit_model_bspline_fast)(t, x, y, s, dt,target_RMS,tt,resol,spline_opts) 
                 for t, x, y,tt in zip(t_plot, x_plot, y_plot,t_plot)
             )
 

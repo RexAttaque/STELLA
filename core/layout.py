@@ -2,6 +2,7 @@ from typing import Sequence
 
 import dearpygui.dearpygui as dpg
 from config.constants import APP_TITLE, TAB_DEFINITIONS, THEME_COLORS, VIEWPORT_SIZE
+from interface.settings_ui import build_settings_window, show_settings_window
 
 
 class LayoutManager:
@@ -16,11 +17,15 @@ class LayoutManager:
         dpg.create_viewport(title=APP_TITLE, width=VIEWPORT_SIZE[0], height=VIEWPORT_SIZE[1])
         self._apply_theme()
         with dpg.window(label=APP_TITLE, tag=self.main_window_tag, width=VIEWPORT_SIZE[0], height=VIEWPORT_SIZE[1]):
+            with dpg.menu_bar(tag="main_menu_bar"):
+                with dpg.menu(label="Settings"):
+                    dpg.add_menu_item(label="Algorithm settings...", callback=lambda: show_settings_window())
             with dpg.tab_bar(tag="main_tab_bar", callback=self._on_tab_change):
                 for tab_def, tab_instance in zip(TAB_DEFINITIONS, self.tabs):
                     tab_tag = f"tab_{tab_def.key}"
                     with dpg.tab(label=tab_def.label, tag=tab_tag) as tab_id:
                         tab_instance.build(parent=tab_id)
+        build_settings_window()
         dpg.set_primary_window(self.main_window_tag, True)
         dpg.setup_dearpygui()
         dpg.show_viewport()

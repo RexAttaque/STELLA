@@ -28,9 +28,23 @@ except NameError:
     structure_size = 3
 
 # A cluster is kept only if it was followed over at least min_steps time steps and holds at least min_events events.
-# During the run, a cluster younger than min_steps that was not extended for 2 steps is retired (its slot reused).
+# During the run, a cluster younger than min_steps that was not extended for more than retire_idle_steps steps is
+# retired (its slot reused).
 min_steps = max(1, int(globals().get("min_steps", 3)))
 min_events = max(1, int(globals().get("min_events", 20)))
+# rules set in the Detection page / Settings window (config/settings.py); the defaults are the former fixed values
+new_cluster_events = max(1, int(globals().get("new_cluster_events", 6)))  # events of its step to start a cluster
+retire_idle_steps = max(0, int(globals().get("retire_idle_steps", 2)))
+split_merge_distance = float(globals().get("split_merge_distance", 4.0))
+split_min_events = max(1, int(globals().get("split_min_events", 4)))
+repair_max_distance = float(globals().get("repair_max_distance", 5.0))
+repair_max_gap = float(globals().get("repair_max_gap", 1.0))
+kd_radius_margin = float(globals().get("kd_radius_margin", 4.0))
+subgrid_factor = float(globals().get("subgrid_factor", 5.0))
+pseudo_min_track_points = int(globals().get("pseudo_min_track_points", 3))
+pseudo_event_factor = float(globals().get("pseudo_event_factor", 2.0))
+pseudo_repair_max_distance = float(globals().get("pseudo_repair_max_distance", 4.0))
+pseudo_repair_max_gap = float(globals().get("pseudo_repair_max_gap", 1.5))
 
 structure_size = max(1, int(structure_size))
 structure = np.ones((structure_size, structure_size), dtype=bool)
@@ -180,7 +194,9 @@ for multi in range(multiN):
             if _tracker is None:  # takes over the clusters started at step 0
                 _tracker = PixelwiseTracker(height, width, structure, multi == 1, buffer, len(X_global),
                                             steps, inactive, inactive_k, valid, x_m, y_m, t_m,
-                                            active_pixels, ind_clust, min_steps=min_steps)
+                                            active_pixels, ind_clust, min_steps=min_steps,
+                                            new_events=new_cluster_events, idle=retire_idle_steps,
+                                            merge_dist=split_merge_distance, split_min=split_min_events)
             _tracker.step(k, xs, ys, _order, _off, X, Y, T, ind_global)
         elif k == 0:
             if pseudo_images:
@@ -473,7 +489,7 @@ for multi in range(multiN):
                         dist_matrix = squareform(pdist(centers))
                         for i in range(len(keys)):
                             for j in range(len(keys)):
-                                if i != j and dist_matrix[i, j] < 4:
+                                if i != j and dist_matrix[i, j] < split_merge_distance:
                                     centers[j] = np.array([-1000, -1000])
                         cluster_centers = dict(zip(keys, centers))
                         
@@ -488,7 +504,7 @@ for multi in range(multiN):
                             
                         label_counts = collections.Counter([label for (_, _, label) in assigned_labels])
                         assigned_labels = [
-                            (x, y, label if label_counts[label] >= 4 else 0)
+                            (x, y, label if label_counts[label] >= split_min_events else 0)
                             for (x, y, label) in assigned_labels
                         ]
                         unique_labels = list(set(label for (_, _, label) in assigned_labels))
@@ -561,12 +577,13 @@ for multi in range(multiN):
             else:  
                 
                 x_m, y_m, t_m, x_clust, y_clust, t_clust, steps, inactive_k, valid, X, Y, T, num_involved,ind_clust,ind_global = kdtree_clustering(
-                    X,Y,T,valid,x_m,y_m,t_m,Range,Lmin,steps,del_,buffer,steps_rev,inactive_k,k,x_clust,y_clust,t_clust,lightweight_mode,num_points,num_involved,ind_clust,ind_global)
+                    X,Y,T,valid,x_m,y_m,t_m,Range,Lmin,steps,del_,buffer,steps_rev,inactive_k,k,x_clust,y_clust,t_clust,lightweight_mode,num_points,num_involved,ind_clust,ind_global,
+                    radius_margin=kd_radius_margin)
             
                         
             if max_tracks > 0 and save_mode==False:
                 if X.size > 0 and np.sum(inactive) > 0:
-                    idx = subgrid_search(height,width,search_factor,minPts,inactive,X,Y)
+                    idx = subgrid_search(height,width,search_factor,minPts,inactive,X,Y, factor=subgrid_factor)
     
                     if np.any(idx):
                         X = X[idx]
@@ -602,7 +619,7 @@ for multi in range(multiN):
                         if len(all_indices) == 0:
                             continue
                     
-                        if np.count_nonzero(T[all_indices] > 0) > 5:
+                        if np.count_nonzero(T[all_indices] > 0) >= new_cluster_events:
                             idx[all_indices] = region_id
                             m += 1
                     
@@ -760,7 +777,7 @@ for multi in range(multiN):
     
             # (the former L_before bookkeeping here was never read)
             _n = int(max_tracks)
-            inactive[:_n][(steps[:_n] < buffer) & (steps[:_n] < min_steps) & ((inactive_k[:_n] + 2) < k)] = 1
+            inactive[:_n][(steps[:_n] < buffer) & (steps[:_n] < min_steps) & ((inactive_k[:_n] + retire_idle_steps) < k)] = 1
 
         del_[:] = 1
         
@@ -785,10 +802,13 @@ for multi in range(multiN):
 
     if lightweight_mode==False:
         # for i in range(3):
-            x_clust, y_clust, t_clust, steps, ind_clust = repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps,dt)
+            x_clust, y_clust, t_clust, steps, ind_clust = repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt,
+                                                                       max_dist=repair_max_distance, max_gap=repair_max_gap)
     else:
         # for i in range(3):
-            x_clust, y_clust, t_clust, steps, ind_clust, x_m, y_m, t_m = repair_tracks_pseudoframes(x_clust, y_clust, t_clust, ind_clust, steps, dt,x_m,y_m,t_m)
+            x_clust, y_clust, t_clust, steps, ind_clust, x_m, y_m, t_m = repair_tracks_pseudoframes(
+            x_clust, y_clust, t_clust, ind_clust, steps, dt, x_m, y_m, t_m,
+            max_dist=pseudo_repair_max_distance, max_gap=pseudo_repair_max_gap)
 
 
     if multi==1:
@@ -877,7 +897,7 @@ for multi in range(multiN):
             n_events = [len(a) for a in ind_clust]
             if not test_mode:
                 for i in range(len(ind_clust)):
-                    if len(x_m[i]) < min_steps or n_events[i]<2 * min_events:  # (twice the minimum, as before)
+                    if len(x_m[i]) < min_steps or n_events[i] < pseudo_event_factor * min_events:
                         x_clust[i] = np.array([], dtype=int)
                         y_clust[i] = np.array([], dtype=int)
                         t_clust[i] = np.array([], dtype=int)
@@ -987,10 +1007,13 @@ if multirun == True:
     dt = int(dt/multitimefactor)
 if lightweight_mode==False:
     # for i in range(3):
-        x_clust, y_clust, t_clust, steps, ind_clust = repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps,dt)
+        x_clust, y_clust, t_clust, steps, ind_clust = repair_tracks(x_clust, y_clust, t_clust, ind_clust, steps, dt,
+                                                                       max_dist=repair_max_distance, max_gap=repair_max_gap)
 else:
     # for i in range(3):
-        x_clust, y_clust, t_clust, steps, ind_clust, x_m, y_m, t_m = repair_tracks_pseudoframes(x_clust, y_clust, t_clust, ind_clust, steps, dt,x_m,y_m,t_m)
+        x_clust, y_clust, t_clust, steps, ind_clust, x_m, y_m, t_m = repair_tracks_pseudoframes(
+            x_clust, y_clust, t_clust, ind_clust, steps, dt, x_m, y_m, t_m,
+            max_dist=pseudo_repair_max_distance, max_gap=pseudo_repair_max_gap)
 
 if not test_mode:
     if isinstance(x_clust, PackedTracks):
@@ -1000,7 +1023,7 @@ if not test_mode:
         y_clust = [arr for arr in y_clust if arr.size > 0]
         t_clust = [arr for arr in t_clust if arr.size > 0]
     else:
-        LLmin = 2
+        LLmin = pseudo_min_track_points - 1
         x_clust, y_clust, t_clust, x_m, y_m, t_m = zip(*[
             (xc, yc, tc, xm, ym, tm)
             for xc, yc, tc, xm, ym, tm in zip(x_clust, y_clust, t_clust, x_m, y_m, t_m)
