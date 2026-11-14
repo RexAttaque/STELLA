@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Sequence, Tuple
 
-APP_TITLE: str = "STELLA - v1.0.2"
+APP_TITLE: str = "STELLA - v1.1 Dev"
 VIEWPORT_SIZE: Tuple[int, int] = (1920, 1030)
 
 DEFAULT_PARAMS: Dict[str, float | int | bool] = {

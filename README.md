@@ -50,7 +50,7 @@ Under `datasets/` you will find synthetic and experimental data as test cases. T
 Larger datasets used as Benchmark and to train artificial neural networks can be found here: [zenodo](https://zenodo.org/records/21531421)
 
 # Quick start guide
-To start the GUI, run `python main.py`. Changes in the set parameters are confirmed by pressing the enter key. As a small tutorial, the processing of experimental data is exemplified below:
+To start the GUI, run `python main.py`. The console window Windows opens for STELLA (double-click, shortcut) is hidden; one STELLA was started from (a terminal) stays visible, and `python main.py --console` keeps it. Changes in the set parameters are confirmed by pressing the enter key. As a small tutorial, the processing of experimental data is exemplified below:
 
 1) **Preprocessing**
 - select `datasets/experimental.npz` as data file (Browse, or paste its path and press Enter): it is loaded right away
