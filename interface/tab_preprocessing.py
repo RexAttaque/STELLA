@@ -23,6 +23,9 @@ from utils.plots import (
     figure_to_rgba_flat,
 )
 
+ACC_APPLY_DELAY_S = 2.0  # -/+ clicks on the accumulation time: applied this long after the last one
+
+
 def _time_sorted(events):
     """Drops non-finite events and returns the event arrays sorted by time.
 
@@ -716,7 +719,36 @@ class PreprocessingTab:
             acc_ms = float(app_data)
         except Exception:
             return
+        if self._is_step_button_click(sender):
+            # -/+ clicks: applied ACC_APPLY_DELAY_S after the last one (each change filters the events again)
+            self._pending_accumulation = (acc_ms, time.perf_counter() + ACC_APPLY_DELAY_S)
+            for tag in list(self._pseudoframe_status_tags):
+                if dpg.does_item_exist(tag):
+                    dpg.set_value(tag, f"Accumulation time {acc_ms:g} ms: applied {ACC_APPLY_DELAY_S:g} s "
+                                       "after the last click.")
+            return
+        self._pending_accumulation = None  # typed (Enter) or reset: now
+        self._apply_accumulation_time(acc_ms)
 
+    @staticmethod
+    def _is_step_button_click(field) -> bool:
+        """The change comes from the field's -/+ buttons: the mouse is on the field and Enter is not pressed
+        (typing ends with Enter; a reset button or a settings reset calls the callback from elsewhere)."""
+        try:
+            if dpg.is_key_down(dpg.mvKey_Return) or dpg.is_key_down(dpg.mvKey_NumPadEnter):
+                return False
+            return bool(dpg.is_item_hovered(field))
+        except Exception:
+            return False
+
+    def process_pending_settings(self) -> None:
+        """Every rendered frame: applies a clicked accumulation time once the clicks have stopped."""
+        pending = getattr(self, "_pending_accumulation", None)
+        if pending is not None and time.perf_counter() >= pending[1]:
+            self._pending_accumulation = None
+            self._apply_accumulation_time(pending[0])
+
+    def _apply_accumulation_time(self, acc_ms: float) -> None:
         self.params["accumulation_time_ms"] = acc_ms
         step = acc_ms * 1000.0  
         self.log_status(f"Accumulation time set to {acc_ms:.3f} ms -> window step {step:.0f} ts-units")

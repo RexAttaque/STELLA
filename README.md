@@ -54,7 +54,7 @@ To start the GUI, run `python main.py`. Changes in the set parameters are confir
 
 1) **Preprocessing**
 - select `datasets/experimental.npz` as data file (Browse, or paste its path and press Enter): it is loaded right away
-- set the accumulation time to 2 ms
+- set the accumulation time to 2 ms (typed values apply on Enter; with the -/+ buttons, 2 s after the last click)
 - `Polarity` selects the events used (ON only, OFF only or both); the sensor size is read from the file (type it in when the file does not give it, 1280 x 720 otherwise)
 - optionally, `Draw new mask` draws a polygon on the pseudo-frame: `exclude` masks remove the events inside, `keep` masks keep only those; enabled masks apply to detection, tracking and validation (masks can be saved and loaded as .json)
 - the bar under the views (on every page, in a tile of its own with the status log, so it stays visible whichever view is open) moves through the recording: click or drag it, Left / Right arrows step one accumulation time (Shift: 10), Home / End, Space plays and pauses. Playback is always drawn at 24 fps; the speed in Hz divides the recording time (1 Hz: real time, 10000 Hz: one second of recording lasts 10000 s), so the window slides smoothly, by less than a step per frame when slow, and snaps back to the nearest step on pause. Its colours show what was actually processed: blue input data, green detected, red tracked (dark red: tracks of an earlier detection run)
